@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>3D-Nav 算法与数据流图谱</title>
+  <style>
+    :root {
+      --bg: #f7f7f5;
+      --panel: #ffffff;
+      --text: #1a1a1a;
+      --muted: #5c5c5c;
+      --faint: #8a8a8a;
+      --line: #d8d8d4;
+      --fill: #efefeb;
+      --accent: #0b57d0;
+      --accent-text: #ffffff;
+      --node: #ffffff;
+      --node-border: #c8c8c2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 48px; }
+    h1 { font-size: 24px; font-weight: 650; margin: 0 0 6px; }
+    .sub { color: var(--muted); margin: 0 0 18px; font-size: 14px; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+    .tab {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .tab.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-text);
+    }
+    .blurb {
+      background: #e8f0fe;
+      border: 1px solid #c5d8fc;
+      color: #174ea6;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+    .main { display: flex; gap: 16px; align-items: flex-start; }
+    .graph-card, .detail-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .graph-card { flex: 1; min-width: 0; }
+    .detail-card { width: 300px; flex-shrink: 0; }
+    .card-h {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .card-h span { color: var(--faint); font-weight: 400; font-size: 12px; }
+    .svg-wrap { overflow: auto; background: #fafaf8; }
+    svg { display: block; min-width: 100%; }
+    .detail-body { padding: 14px; }
+    .pill {
+      display: inline-block;
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--fill);
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .sections { margin-top: 28px; }
+    .sections h2 { font-size: 18px; margin: 0 0 12px; }
+    .block {
+      background: var(--fill);
+      border-left: 3px solid var(--accent);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+    }
+    .block h3 { margin: 0 0 6px; font-size: 14px; }
+    .block p { margin: 0; color: var(--muted); font-size: 13px; }
+    .foot { margin-top: 16px; color: var(--faint); font-size: 12px; }
+    @media (max-width: 860px) {
+      .main { flex-direction: column; }
+      .detail-card { width: 100%; }
+    }
+    @media print {
+      .tab:not(.active) { display: none; }
+      .detail-card { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>3D-Nav 算法与数据流图谱</h1>
+    <p class="sub">点击上方视图切换子系统；点击节点查看实现细节。可用 Edge / Chrome 直接打开；打印可另存为 PDF。</p>
+    <div class="tabs" id="tabs"></div>
+    <div class="blurb" id="blurb"></div>
+    <div class="main">
+      <div class="graph-card">
+        <div class="card-h"><div id="graphTitle"></div><span>DAG · 点击节点</span></div>
+        <div class="svg-wrap" id="svgWrap"></div>
+      </div>
+      <div class="detail-card">
+        <div class="card-h" id="detailTitle">节点</div>
+        <div class="detail-body">
+          <div class="pill" id="detailLayer"></div>
+          <div id="detailText"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sections">
+      <h2>六层逻辑速查</h2>
+      <div class="block">
+        <h3>1. 与 Nav2 的关系（怎么「融合」）</h3>
+        <p>① 对外只复用常见接口形状：NavigateToPose action（/nav3d/navigate_to_pose）、GetPlan 服务（/nav3d/plan_path）、/cmd_vel、/initialpose；② 收到请求后全部转进 nav3d_bridge_node → EgoPlannerCore / Tracker，不启动 Nav2 的 planner_server、controller_server、BT navigator；③ 没有 amcl / nav2_costmap_2d。因此叫「Nav2 形状兼容」，不是装了一整套 Nav2。Web 侧甚至不走 NavigateToPose，只发 /nav3d/start+/nav3d/goal。</p>
+      </div>
+      <div class="block">
+        <h3>2. PCD → 地图（怎么提素）</h3>
+        <p>① PcdLoader 读入原始点云；② PointCloudPreprocessor：按 resolution 把点归入三维体素格子（降采样提素），格子内点数 &lt; min_points_per_voxel 的丢弃，再剔除体积过小的连通簇（min_cluster_voxels）；③ 清洗后的点云并行写入 VoxelGridMap（稠密占据栅格）与 OctomapManager（八叉树）。运行时 LocalGrid 叠动态障碍，MapComposite 局部优先；可选 Inflation。规划后端：use_octomap_map 且 3D 且已建好时用 OctoMap，否则 Voxel。</p>
+      </div>
+      <div class="block">
+        <h3>3. 为何只在楼梯/地面而非高空</h3>
+        <p>① launch 设 planning.traversability:=ground；② 每个候选体素必须同时满足：本身 isFree、向下 depth_cells×xy_radius 内有 occupied 支撑（踏面/楼板）、以 ground_robot_radius 为球的机体净空；③ GroundTraversabilityMap 把「可通行」写成 isFree，A*（GroundSupportedSearcher，在 bridge 内）只能扩展这些格；④ 天井/高空无支撑 → 不可扩展 → 路径只能沿楼梯连通分量上楼，不会「飞捷径」。参数均带 planning. 前缀。</p>
+      </div>
+      <div class="block">
+        <h3>4. 离散搜索 → 平滑 → 校验（全局怎么算）</h3>
+        <p>① 离散搜索：在可通行体素图上做网格 A*（UAV 用 AStar3D/JPS，Ground 用 bridge 的 GroundSupportedSearcher），邻接扩展 + 边采样防穿障，得到折线路径；② 用该折线 fit B 样条作 warm-start；③ BsplineOptimizer 用 L-BFGS 平滑并压障碍/动力学代价（局部 A* rebound cue 推离，无 ESDF）；④ TrajectoryChecker 二次碰撞检查；失败则 ReplanFSM（加重碰撞权重 / 缩短目标等）再试。结果写入 active_trajectory_（整条全局 B 样条）。</p>
+      </div>
+      <div class="block">
+        <h3>5. 全局路径 vs 局部路径 vs 定位</h3>
+        <p>全局路径：起点→最终目标一次规划出的 B 样条，跟踪器沿 path_time 单调前进，并发布剩余轨迹。局部路径（主要 UAV safety）：障碍触发后先在前方 lookahead 米内重规划到临时点，再与原全局轨迹后半段 stitch；A* 探针不可行或 stitch 失败则整段全局重规划到 final goal。地图上的「局部」另指 LocalGrid 动态障碍叠加。定位：外部 /nav3d/current_pose 或 pose_sim，无 SLAM/AMCL。</p>
+      </div>
+      <div class="block">
+        <h3>6. 跟踪与重规划（怎么跟、何时改线）</h3>
+        <p>① 每个控制周期读 /nav3d/current_pose，在 active_trajectory_ 上取 path_time 前视点，算 /cmd_vel；② Ground 用 computeCommandMonotonic：path_time 只增、走廊 snap、爬楼梯井时保高度、接近终点可下降；且跳过 SafetyMonitor；③ UAV 用碰撞感知跟踪，并由 SafetyMonitor 前瞻；触发后 replanFromCurrentPose：冷却 → 先局部 A* 探针+stitch → 否则全局重规划 → 再失败急停。pose_sim 仅仿真时积分 cmd_vel 回灌位姿。</p>
+      </div>
+    </div>
+    <p class="foot">参数要点：planning.traversability、planning.use_octomap_map、planning.ground_support_depth_cells、planning.ground_support_xy_radius_cells、planning.ground_robot_radius、search_algorithm、safety.*</p>
+  </div>
+
+<script>
+const VIEWS = [
+  { id: "system", title: "系统总览", blurb: "交互发起点/目标 → bridge 建图+规划+跟踪 → /cmd_vel 驱动，/current_pose 回灌闭环" },
+  { id: "map", title: "PCD → OctoMap", blurb: "原始点云 → 体素降采样提素/去噪 → 并行建 Voxel 稠密图与 OctoMap 八叉树 → 运行时局部障碍叠加" },
+  { id: "ground", title: "地面可通行", blurb: "三谓词过滤可站立格子 → bridge 内 A* 只在这些格扩展 → 路径贴楼梯/楼板" },
+  { id: "plan", title: "全局规划", blurb: "网格 A* 离散折线 → B样条 warm-start → L-BFGS 平滑 → 碰撞校验；跟踪整条全局轨迹，UAV 可局部 stitch 重规划" },
+  { id: "nav2", title: "Nav2 融合", blurb: "只复用接口形状（action/srv/topic）；算法在自研 bridge+EgoPlanner，不跑 Nav2 全栈" },
+  { id: "track", title: "跟踪与重规划", blurb: "每周期跟全局 B 样条算 cmd_vel；Ground 跳过 safety；UAV 遇障先局部 stitch 再全局重规划" },
+];
+
+const GRAPH = {
+  system: {
+    rankLabels: ["交互", "桥接", "地图", "规划", "控制", "位姿"],
+    nodes: [
+      { id: "web", label: "Web UI", sub: "rosbridge :9090", layer: "交互", detail: "① 浏览器连 rosbridge:9090；② 点「起点/目标」只在 UI 排队坐标；③ 点「启动」才经 WebSocket 发 /nav3d/start 与 /nav3d/goal（可发 /nav3d/cancel）。Web 不跑 A*/优化，也不调 NavigateToPose。" },
+      { id: "rviz", label: "RViz", sub: "clicked_point", layer: "交互", detail: "① /initialpose（2D Pose Estimate）或 Publish Point 设起点；② /clicked_point 交替作为起/终点；③ 订阅 /nav3d/trajectory、planning_occupied_markers 看路径与碰撞图。与 Web 共用同一 bridge。" },
+      { id: "bridge", label: "nav3d_bridge_node", sub: "ROS2 Humble", layer: "桥接", detail: "中枢节点：启动时加载 PCD 建图；收 start/goal 后 snap→planWithFallbacks；持有 active_trajectory_；定时用 current_pose 算 cmd_vel；发 status。ground 时在本文件注入 GroundSupportedSearcher。" },
+      { id: "map", label: "Map 层", sub: "Voxel / OctoMap", layer: "地图", detail: "PCD 先按 resolution 体素降采样提素并去噪，再并行建成 VoxelGridMap（稠密占据）与 OctomapManager（八叉树）。运行时 LocalGrid 叠动态障碍；ground 再包 GroundTraversabilityMap。" },
+      { id: "plan", label: "Planner", sub: "EgoPlannerCore", layer: "规划", detail: "①网格 A* 在可通行体素上搜起点→终点折线；②折线拟合 B 样条；③ L-BFGS 平滑；④ TrajectoryChecker。成功则得到全局 active_trajectory_，跟踪器沿其 path_time 前进。" },
+      { id: "ctrl", label: "Tracker", sub: "cmd_vel", layer: "控制", detail: "每个控制周期：用当前位姿在全局 B 样条上取前视点 → 算线速度/角速度 → 发 /cmd_vel。ground 用 Monotonic；UAV 用碰撞感知采样。不重新做全局 A*（除非 safety 触发）。" },
+      { id: "pose", label: "位姿源", sub: "current_pose", layer: "位姿", detail: "闭环反馈话题 /nav3d/current_pose（frame=map）。仿真：nav3d_cmd_vel_pose_sim 积分 /cmd_vel，并在 /nav3d/pose_set、/start、/initialpose 时传送。真机：换成外部定位。无 AMCL。" },
+    ],
+    edges: [
+      { from: "web", to: "bridge", label: "ws" },
+      { from: "rviz", to: "bridge" },
+      { from: "bridge", to: "map" },
+      { from: "map", to: "plan" },
+      { from: "plan", to: "ctrl" },
+      { from: "ctrl", to: "pose", label: "cmd_vel" },
+      { from: "pose", to: "bridge", label: "pose" },
+      { from: "bridge", to: "ctrl" },
+    ],
+  },
+  map: {
+    rankLabels: ["输入", "预处理", "全局图", "运行时", "规划用图"],
+    nodes: [
+      { id: "pcd", label: "PCD 文件", sub: "原始点云", layer: "输入", detail: "PcdLoader::load 读 ASCII/Binary PCD（如 building2_9.pcd）。此时还是稠密无序点，尚未成图。launch 的 pcd_path 或 /nav3d/load_pcd_path 触发加载。" },
+      { id: "pre", label: "PointCloudPreprocessor", sub: "降采样提素", layer: "预处理", detail: "按 preprocessor.resolution 把每个点落入三维体素格子（提素/降采样）；格子内点数不足 min_points_per_voxel 则丢弃；再按连通域剔除过小簇 min_cluster_voxels。输出洗净的稀疏点云，供建图。" },
+      { id: "voxel", label: "VoxelGridMap", sub: "稠密占据栅格", layer: "全局图", detail: "MapBuilder::buildVoxelMapFromPointCloud 把清洗点云交给 VoxelGridMap::fromPointCloud：按 resolution 把每个点落入三维格子并写入 occupied_（同格去重）。occupied_ 有的格=障碍；边界内且不在集合中=自由。查询：isOccupied(p)=该格是否占据；isFree(p)=在界内且非占据。默认即全局规划后端（未开 use_octomap_map 时）。" },
+      { id: "octo", label: "OctomapManager", sub: "八叉树占据", layer: "全局图", detail: "同一清洗点云 buildFromPointCloud 建成八叉树，可射线更新/序列化。仅当 planning.use_octomap_map=true 且 mode=3d 且已建好时，activeGlobalPlanningMap 才用它，否则仍用 Voxel。" },
+      { id: "local", label: "LocalGrid", sub: "动态局部图", layer: "运行时", detail: "订阅 /nav3d/local_pointcloud，把近期感知点写入机器人周围局部栅格。与静态全局图相对：只覆盖局部窗口，用于临时障碍。" },
+      { id: "comp", label: "MapComposite", sub: "局部优先融合", layer: "运行时", detail: "查询时先看 LocalGrid，再回落到全局 Voxel/OctoMap。可选 InflationLayer 按机器人半径膨胀障碍，保证路径留出走形空隙。" },
+      { id: "active", label: "activePlanningMap", sub: "规划瞬间用图", layer: "规划用图", detail: "makePlanningMap 由内到外组装：① activeGlobalPlanningMap（Voxel 或 3D+开关下的 OctoMap）；② 有局部观测时套 MapComposite（LocalGrid 优先）；③ inflation_radius>0 时套 InflationLayer（距障≤半径也算占）；④ ground 模式最外层再套 GroundTraversabilityMap（isFree=支撑+净空）。A*/优化/跟踪查的是最外层 IMap。" },
+    ],
+    edges: [
+      { from: "pcd", to: "pre" }, { from: "pre", to: "voxel" }, { from: "pre", to: "octo" },
+      { from: "voxel", to: "comp" }, { from: "octo", to: "comp" }, { from: "local", to: "comp" },
+      { from: "comp", to: "active" },
+    ],
+  },
+  ground: {
+    rankLabels: ["模式", "谓词", "包装", "搜索约束", "结果"],
+    nodes: [
+      { id: "mode", label: "traversability=ground", sub: "非 UAV 自由飞", layer: "模式", detail: "① launch：planning_traversability:=ground（UAV 模式只需自由空间）；② bridge 切换搜索器为 GroundSupportedSearcher，并把规划图包进 GroundTraversabilityMap；③ 跟踪改 Monotonic，且跳过 SafetyMonitor。" },
+      { id: "free", label: "isFree(cell)", sub: "格子本身空", layer: "谓词", detail: "候选站立格不能是 occupied。2D 投影里 unknown 也当不可通行，防止穿越未观测区域。这是三谓词的第一关。" },
+      { id: "sup", label: "hasGroundSupport", sub: "脚下有支撑", layer: "谓词", detail: "从当前格向下在 planning.ground_support_depth_cells 深度、planning.ground_support_xy_radius_cells 水平足迹内找 occupied（踏面/楼板）。找不到 = 悬空，A* 不扩展 → 禁止高空捷径。" },
+      { id: "clr", label: "hasBodyClearance", sub: "身体塞得下", layer: "谓词", detail: "以格中心为球心、planning.ground_robot_radius 为半径，球体不得与占用体素相交。保证「脚能站」之外「机身也能过」楼梯狭缝。" },
+      { id: "gtm", label: "GroundTraversabilityMap", sub: "bridge 内 IMap", layer: "包装", detail: "写在 nav3d_bridge_node.cpp：对外 IMap::isFree 改为「三谓词合取」，isOccupied 仍透传底层图。这样 EgoPlanner/A* 不用改接口，只要查 isFree 就会自动贴地。" },
+      { id: "gss", label: "GroundSupportedSearcher", sub: "bridge 内 A*", layer: "搜索约束", detail: "① 起终点 snap 到附近可通行格（ground_snap_radius_cells）；② 在 ground 索引上 open-set A*，邻接边 canMoveGround+采样防穿墙；③ 成功路径每个点重复 3 次（kGroundWarmStartMultiplicity）再交给 B 样条。" },
+      { id: "out", label: "贴地/贴楼梯路径", sub: "非高空捷径", layer: "结果", detail: "离散最优 = 可通行连通分量上的最短路径。楼梯踏面有支撑可走，天井中间无支撑不能跳。后续 B 样条/L-BFGS 只在该折线附近光滑，不会突然改成飞越。" },
+    ],
+    edges: [
+      { from: "mode", to: "free" }, { from: "mode", to: "sup" }, { from: "mode", to: "clr" },
+      { from: "free", to: "gtm" }, { from: "sup", to: "gtm" }, { from: "clr", to: "gtm" },
+      { from: "gtm", to: "gss" }, { from: "gss", to: "out" },
+    ],
+  },
+  plan: {
+    rankLabels: ["触发", "离散搜索", "平滑优化", "校验", "发布"],
+    nodes: [
+      { id: "trig", label: "启动规划", sub: "topic / action / srv", layer: "触发", detail: "入口三种：① Web/RViz 发 start+goal → onGoal；② NavigateToPose；③ GetPlan（只规划不跟踪）。先把起终点 snap 到可通行格，再 planWithActiveMap（一次全局：start→最终 goal）。" },
+      { id: "search", label: "离散路径", sub: "网格 A* 折线", layer: "离散搜索", detail: "在规划图体素格子上跑 A*：从起点格向邻格扩展（UAV：AStar3D/JPS；Ground：仅可通行+有支撑的格），边连续采样防穿墙。输出折线航点序列（最短路径意义下的离散最优），不是最终平滑轨迹。" },
+      { id: "bs", label: "B-spline warm-start", sub: "折线→曲线初值", layer: "平滑优化", detail: "UniformBspline::fitThroughWaypoints 把 A* 折线拟合成均匀 B 样条，作为后续优化的初值；Ground 路径点还会重复 3 次以稳住样条形状。" },
+      { id: "lbfgs", label: "BsplineOptimizer", sub: "L-BFGS 连续优化", layer: "平滑优化", detail: "在控制点上做 L-BFGS：压平滑/障碍/动力学代价。碰撞处用局部小窗口 A*（appendLocalReboundCues）生成绕障 cue（无 ESDF）。得到可跟踪的连续全局轨迹。" },
+      { id: "chk", label: "TrajectoryChecker", sub: "+ ReplanFSM", layer: "校验", detail: "沿样条按 publish_sample_dt 密采样，查规划图是否撞障；可选动力学可行性。失败：ReplanFSM 加重碰撞权重重优化、缩短目标再搜等。耗尽 cascade 才 plan_failed。" },
+      { id: "pub", label: "/nav3d/trajectory", sub: "全局轨迹发布", layer: "发布", detail: "成功：active_trajectory_=B 样条，active_goal_=最终点，发布 Path+Marker，tracking_active_ 打开。之后控制环只跟这条（或 UAV stitch 更新后的版本），直到到达/取消/失败。" },
+    ],
+    edges: [
+      { from: "trig", to: "search" }, { from: "search", to: "bs" }, { from: "bs", to: "lbfgs" },
+      { from: "lbfgs", to: "chk" }, { from: "chk", to: "pub" }, { from: "chk", to: "lbfgs", label: "fallback" },
+    ],
+  },
+  nav2: {
+    rankLabels: ["兼容面", "本系统实现", "未使用"],
+    nodes: [
+      { id: "ntp", label: "NavigateToPose", sub: "/nav3d/navigate_to_pose", layer: "兼容面", detail: "nav2_msgs/action 服务器：客户端给目标 Pose → bridge 内部规划+跟踪，并反馈 distance_remaining 等。形状像 Nav2，实现是 EgoPlanner+Tracker。Web 默认不用此 action。" },
+      { id: "gp", label: "GetPlan", sub: "/nav3d/plan_path", layer: "兼容面", detail: "nav_msgs/srv/GetPlan：给定起终点只算一条 Path 返回，不启动跟踪、不发 cmd_vel。适合「只要路径可视化/下游自用」。" },
+      { id: "cv", label: "/cmd_vel", sub: "Twist 输出", layer: "兼容面", detail: "跟踪器输出的线/角速度。名字与 Nav2 controller 习惯一致，便于接 Gazebo/真机底盘或本仓库的 pose_sim。" },
+      { id: "ip", label: "/initialpose", sub: "设规划起点", layer: "兼容面", detail: "RViz「2D Pose Estimate」话题。此处语义=设置/传送规划起点（并 pub /nav3d/pose_set），不做粒子滤波定位。" },
+      { id: "impl", label: "EgoPlanner + Bridge", sub: "真正干活的栈", layer: "本系统实现", detail: "map_core / planner_core / controller_core + nav3d_bridge_node。Ground 可通行与搜索也在 bridge。没有 Nav2 lifecycle 节点图。" },
+      { id: "no", label: "无 AMCL / BT / costmap", sub: "刻意省略", layer: "未使用", detail: "不跑 amcl、nav2_costmap_2d、controller_server、planner_server、behavior_tree。代价地图由自研 Voxel/OctoMap+LocalGrid 替代；定位靠外部 /nav3d/current_pose。" },
+    ],
+    edges: [
+      { from: "ntp", to: "impl" }, { from: "gp", to: "impl" }, { from: "cv", to: "impl" },
+      { from: "ip", to: "impl" }, { from: "impl", to: "no", label: "≠ full Nav2" },
+    ],
+  },
+  track: {
+    rankLabels: ["位姿", "跟踪", "安全", "重规划"],
+    nodes: [
+      { id: "cur", label: "/nav3d/current_pose", sub: "闭环位姿输入", layer: "位姿", detail: "① 控制与 safety 都读它；② pose_sim：积分 /cmd_vel，并在 pose_set/start/initialpose 传送；③ 真机：外部定位直接发。frame_id 必须与 bridge 的 map 一致。" },
+      { id: "mono", label: "Monotonic Tracker", sub: "跟全局轨迹(ground)", layer: "跟踪", detail: "① path_time 只增不减，防止在楼梯上来回抖；② 横向偏离时在走廊半径内 snap 回轨迹；③ 仍在井内爬升时保留高度，不把 z 拉向地面；④ 近终点允许下降。输出 cmd_vel 指向前视点。" },
+      { id: "uavt", label: "Collision Tracker", sub: "跟全局轨迹(UAV)", layer: "跟踪", detail: "同样跟 active_trajectory_：取 path_time+lookahead 目标点，查询规划图，避开占用后再生成 cmd_vel。终点判定仍对照 active_goal_。" },
+      { id: "skip", label: "Safety 跳过", sub: "ground 策略", layer: "安全", detail: "evaluateActiveTrajectorySafety 在 ground 直接 return：楼梯体素窄、轨迹贴边易误判，强行前瞻会反复 cancel/replan。Ground 依赖 Monotonic 几何约束保安全。" },
+      { id: "safe", label: "SafetyMonitor", sub: "UAV 前瞻", layer: "安全", detail: "位姿落入占用→急停；否则 TrajectoryChecker 查前方轨迹段（含 LocalGrid）。判定 ReplanNeeded 或 EmergencyStop，再交给 replanFromCurrentPose。" },
+      { id: "rep", label: "局部 stitch / 全局重规划", sub: "UAV replan", layer: "重规划", detail: "① 冷却 safety.replan_cooldown_sec；② 取前方 lookahead 临时目标，先 raw A* 探针；③ 可行则局部 EGO，并把新段与旧全局后半段 stitch；④ 否则 current→final goal 全局重规划；⑤ 再失败急停并清轨迹。" },
+    ],
+    edges: [
+      { from: "cur", to: "mono" }, { from: "cur", to: "uavt" }, { from: "mono", to: "skip" },
+      { from: "uavt", to: "safe" }, { from: "safe", to: "rep" }, { from: "skip", to: "rep", label: "不触发" },
+    ],
+  },
+};
+
+const NODE_W = 168, NODE_H = 52, RANK_GAP = 72, NODE_GAP = 36, PAD = 28;
+
+function layoutGraph(graph) {
+  const ranks = graph.rankLabels.map((label, i) => ({
+    rank: i, label, nodes: graph.nodes.filter((n) => n.layer === label),
+  }));
+  const pos = {};
+  let maxW = 0, y = PAD;
+  ranks.forEach((r) => {
+    const n = r.nodes.length || 1;
+    const rowW = n * NODE_W + (n - 1) * NODE_GAP;
+    maxW = Math.max(maxW, rowW);
+    r.y = y;
+    r.height = NODE_H + 20;
+    r.width = 0; // filled later
+    r.nodes.forEach((node, i) => {
+      pos[node.id] = { x: 0, y: y + 18, order: i, rank: r.rank };
+    });
+    y += r.height + RANK_GAP;
+  });
+  const width = Math.max(maxW + PAD * 2, 640);
+  ranks.forEach((r) => {
+    const n = r.nodes.length;
+    const rowW = n * NODE_W + (n - 1) * NODE_GAP;
+    const startX = (width - rowW) / 2;
+    r.x = startX - 8;
+    r.width = rowW + 16;
+    r.nodes.forEach((node, i) => {
+      pos[node.id].x = startX + i * (NODE_W + NODE_GAP);
+    });
+  });
+  return { pos, ranks, width, height: y - RANK_GAP + PAD };
+}
+
+let view = "system";
+let selected = null;
+
+function renderTabs() {
+  const el = document.getElementById("tabs");
+  el.innerHTML = VIEWS.map((v) =>
+    `<button class="tab${v.id === view ? " active" : ""}" data-id="${v.id}">${v.title}</button>`
+  ).join("");
+  el.querySelectorAll(".tab").forEach((btn) => {
+    btn.onclick = () => { view = btn.dataset.id; selected = null; render(); };
+  });
+}
+
+function showDetail(node) {
+  document.getElementById("detailTitle").textContent = node.label + (node.sub ? "" : "");
+  document.getElementById("detailLayer").textContent = node.layer + (node.sub ? " · " + node.sub : "");
+  document.getElementById("detailText").textContent = node.detail;
+}
+
+function render() {
+  renderTabs();
+  const meta = VIEWS.find((v) => v.id === view);
+  const graph = GRAPH[view];
+  document.getElementById("blurb").textContent = meta.blurb;
+  document.getElementById("graphTitle").textContent = meta.title + " 流程图";
+
+  const { pos, ranks, width, height } = layoutGraph(graph);
+  const active = graph.nodes.find((n) => n.id === selected) || graph.nodes[0];
+  showDetail(active);
+
+  const edgePaths = graph.edges.map((e) => {
+    const a = pos[e.from], b = pos[e.to];
+    if (!a || !b) return "";
+    const sx = a.x + NODE_W / 2, sy = a.y + NODE_H;
+    const tx = b.x + NODE_W / 2, ty = b.y;
+    const back = a.rank >= b.rank;
+    const midY = (sy + ty) / 2;
+    const d = back
+      ? `M ${sx} ${sy} C ${sx + 48} ${sy}, ${tx + 48} ${ty}, ${tx} ${ty}`
+      : `M ${sx} ${sy} C ${sx} ${midY}, ${tx} ${midY}, ${tx} ${ty}`;
+    const lab = e.label
+      ? `<text x="${(sx + tx) / 2 + (back ? 28 : 0)}" y="${(sy + ty) / 2 - 4}" text-anchor="middle" fill="#8a8a8a" font-size="10">${e.label}</text>`
+      : "";
+    return `<path d="${d}" fill="none" stroke="${back ? "#0b57d0" : "#9a9a94}" stroke-width="1.5" ${back ? 'stroke-dasharray="5 4"' : ""} marker-end="url(#arrow)" />${lab}`;
+  }).join("");
+
+  const bandRects = ranks.map((r) =>
+    `<rect x="${r.x}" y="${r.y}" width="${r.width}" height="${r.height}" fill="#efefeb" rx="4"/>
+     <text x="${r.x + 8}" y="${r.y + 14}" fill="#8a8a8a" font-size="10">${r.label}</text>`
+  ).join("");
+
+  const nodes = graph.nodes.map((n) => {
+    const p = pos[n.id];
+    const sel = n.id === active.id;
+    return `<g data-id="${n.id}" style="cursor:pointer">
+      <rect x="${p.x}" y="${p.y}" width="${NODE_W}" height="${NODE_H}" rx="6"
+        fill="${sel ? "#0b57d0" : "#ffffff"}" stroke="${sel ? "#0b57d0" : "#c8c8c2"}" stroke-width="${sel ? 2 : 1}"/>
+      <text x="${p.x + NODE_W / 2}" y="${p.y + 22}" text-anchor="middle"
+        fill="${sel ? "#fff" : "#1a1a1a"}" font-size="12" font-weight="600">${escapeXml(n.label)}</text>
+      <text x="${p.x + NODE_W / 2}" y="${p.y + 38}" text-anchor="middle"
+        fill="${sel ? "#e8f0fe" : "#8a8a8a"}" font-size="10">${escapeXml(n.sub || "")}</text>
+    </g>`;
+  }).join("");
+
+  document.getElementById("svgWrap").innerHTML = `
+    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#9a9a94"/>
+        </marker>
+      </defs>
+      ${bandRects}${edgePaths}${nodes}
+    </svg>`;
+
+  document.querySelectorAll("#svgWrap g[data-id]").forEach((g) => {
+    g.onclick = () => { selected = g.getAttribute("data-id"); render(); };
+  });
+}
+
+function escapeXml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+render();
+</script>
+</body>
+</html>

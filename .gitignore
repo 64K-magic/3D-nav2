@@ -1,0 +1,7 @@
+build/*
+log/*
+imgs/*
+NAV2 3D.xmind.bak
+NAV2 3D.knowledge.bak.xmind
+tools/*.make
+install/*
