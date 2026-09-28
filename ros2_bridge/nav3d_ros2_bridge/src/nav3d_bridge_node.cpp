@@ -124,7 +124,8 @@ struct GroundQueueNodeCompare {
 struct GroundSearchOptions {
   nav3d::planner::PlanningMode mode = nav3d::planner::PlanningMode::Mode3D;
   int max_iterations = 200000;
-  int snap_radius_cells = 12;
+  // Keep snap small: large radii block the planning callback for a long time.
+  int snap_radius_cells = 6;
   int support_xy_radius_cells = 1;
   int support_depth_cells = 1;
   double robot_radius = 0.25;
@@ -303,7 +304,8 @@ GroundSnapCandidate makeGroundSnapCandidate(
 
 bool isBetterGroundSnapCandidate(
   const GroundSnapCandidate& candidate,
-  const GroundSnapCandidate& best)
+  const GroundSnapCandidate& best,
+  const GroundIndex& requested)
 {
   constexpr double kEpsilon = 1e-12;
   if (candidate.distance < best.distance - kEpsilon) {
@@ -318,8 +320,15 @@ bool isBetterGroundSnapCandidate(
   if (candidate.xy_distance > best.xy_distance + kEpsilon) {
     return false;
   }
+  // Prefer the tread just above the click (not a higher free cell that can
+  // land on a poorly-connected ribbon and make A* crawl for minutes).
+  const int cand_above = std::max(0, candidate.idx.z - requested.z);
+  const int best_above = std::max(0, best.idx.z - requested.z);
+  if (cand_above != best_above) {
+    return cand_above < best_above;
+  }
   if (candidate.idx.z != best.idx.z) {
-    return candidate.idx.z > best.idx.z;
+    return candidate.idx.z < best.idx.z;
   }
   if (candidate.idx.y != best.idx.y) {
     return candidate.idx.y < best.idx.y;
@@ -338,23 +347,38 @@ GroundIndex resolveGroundIndex(
 
   std::optional<GroundSnapCandidate> best;
   const int radius = options.snap_radius_cells;
-  for (int dx = -radius; dx <= radius; ++dx) {
-    for (int dy = -radius; dy <= radius; ++dy) {
-      for (int dz = -radius; dz <= radius; ++dz) {
-        const GroundIndex candidate{
-          requested.x + dx,
-          requested.y + dy,
-          requested.z + dz,
-        };
-        if (!isGroundTraversable(map, candidate, options)) {
-          continue;
-        }
-        const auto snap_candidate =
-          makeGroundSnapCandidate(requested, candidate, map.getResolution());
-        if (!best.has_value() || isBetterGroundSnapCandidate(snap_candidate, *best)) {
-          best = snap_candidate;
+  // Expand by Chebyshev shell; keep the global best across shells so we do not
+  // lock onto a high free cell in an early shell that disconnects the graph.
+  for (int shell = 1; shell <= radius; ++shell) {
+    for (int dx = -shell; dx <= shell; ++dx) {
+      for (int dy = -shell; dy <= shell; ++dy) {
+        for (int dz = -shell; dz <= shell; ++dz) {
+          if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != shell) {
+            continue;
+          }
+          const GroundIndex candidate{
+            requested.x + dx,
+            requested.y + dy,
+            requested.z + dz,
+          };
+          if (!isGroundTraversable(map, candidate, options)) {
+            continue;
+          }
+          const auto snap_candidate =
+            makeGroundSnapCandidate(requested, candidate, map.getResolution());
+          if (!best.has_value() ||
+              isBetterGroundSnapCandidate(snap_candidate, *best, requested)) {
+            best = snap_candidate;
+          }
         }
       }
+    }
+    // Good enough: same XY column, one cell above the click (typical floor→tread).
+    if (best.has_value() &&
+        best->idx.x == requested.x &&
+        best->idx.y == requested.y &&
+        best->idx.z == requested.z + 1) {
+      return best->idx;
     }
   }
   return best.has_value() ? best->idx : requested;
@@ -998,15 +1022,12 @@ public:
     }
     configureController();
     if (controller_enabled_) {
-      // Keep the control timer on the control callback group so pose handling
-      // / trajectory republish cannot starve cmd_vel on the default group.
       controller_timer_ = create_wall_timer(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::duration<double>(controller_control_dt_)),
         [this]() {
           onControllerTimer();
-        },
-        control_callback_group_);
+        });
     }
     startStaticVisualizationRepublish();
 
@@ -1943,9 +1964,15 @@ private:
       return;
     }
 
+    const auto requested = toPoint(msg);
+    RCLCPP_INFO(
+      get_logger(),
+      "start_received x=%.3f y=%.3f z=%.3f (snapping...)",
+      requested.x,
+      requested.y,
+      requested.z);
     // Snap start onto a free/traversable cell (esp. ground mode: floor voxels
     // are occupied; standing on z=0 often leaves the tracker with zero cmd_vel).
-    const auto requested = toPoint(msg);
     start_ = resolveClickedPoint(requested, "start");
     // v3.8: setting a fresh start invalidates the previous current_position_.
     // Otherwise W-A's planToGoal would use the stale current_position_ (left
@@ -2046,11 +2073,42 @@ private:
 
     const double resolution = planning_map.getResolution();
     const auto requested_idx = worldToGroundIndex(requested, resolution);
-    const auto resolved_idx = resolveGroundIndex(planning_map, requested_idx, ground_search_options_);
-    if (!isGroundTraversable(planning_map, resolved_idx, ground_search_options_)) {
-      return requested;
+    auto try_idx = [&](const GroundIndex& idx) -> std::optional<nav3d::common::Point3D> {
+      if (!isGroundTraversable(planning_map, idx, ground_search_options_)) {
+        return std::nullopt;
+      }
+      return groundIndexToWorld(idx, resolution);
+    };
+
+    // Keep an already-valid tread click (do not lift z=0.3 → 0.5).
+    if (auto p = try_idx(requested_idx)) {
+      return *p;
     }
-    return groundIndexToWorld(resolved_idx, resolution);
+
+    // Prefer the first tread above the click, then a small XY ring at that height.
+    for (int dz = 1; dz <= 4; ++dz) {
+      if (auto p = try_idx({requested_idx.x, requested_idx.y, requested_idx.z + dz})) {
+        return *p;
+      }
+      for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+          if (dx == 0 && dy == 0) {
+            continue;
+          }
+          if (auto p = try_idx(
+                {requested_idx.x + dx, requested_idx.y + dy, requested_idx.z + dz})) {
+            return *p;
+          }
+        }
+      }
+    }
+
+    const auto resolved_idx =
+      resolveGroundIndex(planning_map, requested_idx, ground_search_options_);
+    if (auto p = try_idx(resolved_idx)) {
+      return *p;
+    }
+    return requested;
   }
 
   bool hasOccupiedNeighbor(
@@ -2186,12 +2244,18 @@ private:
       return;
     }
 
+    const auto requested = toPoint(msg);
+    RCLCPP_INFO(
+      get_logger(),
+      "goal_received x=%.3f y=%.3f z=%.3f (snapping...)",
+      requested.x,
+      requested.y,
+      requested.z);
     // Snap goal to a free, traversable cell when the requested point is
     // occupied / unsupported. Web UI publishes /nav3d/goal directly without
     // going through /clicked_point, so without this call a click that lands
     // on an obstacle voxel falls through to plan_failed status=no_path with
     // no recovery. Match onClickedPoint behaviour: snap, log, then plan.
-    const auto requested = toPoint(msg);
     const auto resolved = resolveClickedPoint(requested, "goal");
     planToGoal(resolved, "plan");
   }
@@ -2474,9 +2538,15 @@ private:
   decltype(auto) makeCollisionPlanningMap(Callback&& callback) const
   {
     const nav3d::map::IMap& global_map = activeGlobalPlanningMap();
+    // Ground mode already enforces support + body clearance via
+    // ground_robot_radius. Applying UAV-style inflation (e.g. 0.5 m) lifts
+    // free cells off the tread onto a thin disconnected shell and makes A*
+    // crawl / hang on building-scale maps.
+    const bool apply_inflation =
+      planning_inflation_radius_ > 0.0 && !groundTraversabilityEnabled();
     if (hasLocalObservations()) {
       nav3d::map::MapComposite composite(global_map, *local_grid_);
-      if (planning_inflation_radius_ > 0.0) {
+      if (apply_inflation) {
         nav3d::collision::InflationLayer planning_map(
           composite,
           planning_inflation_radius_);
@@ -2484,7 +2554,7 @@ private:
       }
       return std::forward<Callback>(callback)(composite);
     }
-    if (planning_inflation_radius_ > 0.0) {
+    if (apply_inflation) {
       nav3d::collision::InflationLayer planning_map(
         global_map,
         planning_inflation_radius_);

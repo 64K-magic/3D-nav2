@@ -13,12 +13,13 @@ nav3d_bridge_node:
     planning.search_algorithm: astar
     planning.traversability: uav
     planning.use_octomap_map: false
+    # UAV free-space clearance. Ignored in ground mode (uses ground_robot_radius).
     planning.inflation_radius: 0.0
     planning.ground_strict_direct_support: false
-    planning.ground_snap_radius_cells: 12
+    planning.ground_snap_radius_cells: 6
     planning.ground_support_xy_radius_cells: 1
     planning.ground_support_depth_cells: 1
-    planning.ground_robot_radius: 0.25
+    planning.ground_robot_radius: 0.75
     planning.uav_endpoint_snap_radius_cells: 12
     planning.enable_dynamic_feasibility_check: false
     planning.dynamic_feasibility_mode: sampled
