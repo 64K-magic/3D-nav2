@@ -17,6 +17,7 @@ add_library(nav3d_core
   planner_core/src/bspline/bspline_optimizer.cpp
   planner_core/src/bspline/uniform_bspline.cpp
   collision_engine/src/inflation_layer.cpp
+  collision_engine/src/footprint_3d.cpp
   collision_engine/src/sphere_checker.cpp
   collision_engine/src/trajectory_checker.cpp
   collision_engine/src/trajectory_feasibility_checker.cpp
@@ -59,6 +60,7 @@ if(NAV3D_BUILD_TESTS)
     tests/test_bspline_optimizer.cpp
     tests/test_uniform_bspline.cpp
     tests/test_inflation_layer.cpp
+    tests/test_footprint_3d.cpp
     tests/test_sphere_checker.cpp
     tests/test_trajectory_checker.cpp
     tests/test_trajectory_feasibility_checker.cpp

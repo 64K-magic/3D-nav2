@@ -283,14 +283,30 @@ EgoPlanResult EgoPlannerCore::runSingleAttempt(
 
   const auto allocated_optimizer_config =
     allocateInitialTime(result.search.path, config_, optimizer_config);
-  result.optimization =
-    BsplineOptimizer::optimize(result.search.path, map, allocated_optimizer_config);
-  result.trajectory = result.optimization.spline;
-  if (!result.optimization.success) {
-    result.status = EgoPlanStatus::OptimizationFailed;
-    result.fallback = fallback_fsm.onTrajectoryCollision(start, requested_goal, false);
-    result.fallback_history.push_back(result.fallback);
-    return result;
+
+  if (config_.prefer_path_following_trajectory) {
+    const auto path_following_trajectory =
+      makePathFollowingTrajectory(result.search.path, map, allocated_optimizer_config.interval);
+    if (!path_following_trajectory.has_value()) {
+      result.status = EgoPlanStatus::OptimizationFailed;
+      result.fallback = fallback_fsm.onTrajectoryCollision(start, requested_goal, false);
+      result.fallback_history.push_back(result.fallback);
+      return result;
+    }
+    result.optimization.success = true;
+    result.optimization.spline = *path_following_trajectory;
+    result.optimization.warm_start = *path_following_trajectory;
+    result.trajectory = *path_following_trajectory;
+  } else {
+    result.optimization =
+      BsplineOptimizer::optimize(result.search.path, map, allocated_optimizer_config);
+    result.trajectory = result.optimization.spline;
+    if (!result.optimization.success) {
+      result.status = EgoPlanStatus::OptimizationFailed;
+      result.fallback = fallback_fsm.onTrajectoryCollision(start, requested_goal, false);
+      result.fallback_history.push_back(result.fallback);
+      return result;
+    }
   }
 
   if (!enforceDynamicFeasibility(config_, result)) {

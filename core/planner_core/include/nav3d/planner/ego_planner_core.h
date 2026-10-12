@@ -41,6 +41,9 @@ struct EgoPlannerCoreConfig {
   double max_dynamic_time_scale = 10.0;
   bool enable_initial_time_allocation = false;
   double min_time_allocation_interval = 0.05;
+  // Ground mode: keep the discrete supported path (landing arcs / stair treads).
+  // Cubic B-spline smoothing otherwise chords L1→L2 through the stairwell.
+  bool prefer_path_following_trajectory = false;
 };
 
 struct EgoPlanResult {

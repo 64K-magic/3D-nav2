@@ -19,7 +19,36 @@ nav3d_bridge_node:
     planning.ground_snap_radius_cells: 6
     planning.ground_support_xy_radius_cells: 1
     planning.ground_support_depth_cells: 1
-    planning.ground_robot_radius: 0.75
+    # A* sphere clearance. Keep ≤0.25 on building2_9 — 0.30+ seals hallways
+    # (start component ~2500 cells, never reaches west wing). Corner avoidance
+    # uses soft keepout + wall_clearance, not a fatter sphere.
+    planning.ground_robot_radius: 0.25
+    planning.ground_footprint_enabled: true
+    planning.ground_footprint_xy: [-0.67, -0.4, -0.67, 0.4, 0.67, 0.4, 0.67, -0.4]
+    planning.ground_body_clearance: 0.5
+    planning.ground_body_height: 0.35
+    planning.ground_max_pitch_rad: 0.7
+    planning.ground_terrain_ignore_margin: 0.55
+    planning.ground_footprint_sample_step: 0.1
+    # Stair corner: strict concave-L soft cost (loose L made a flat field so
+    # keepout never preferred the outer arc). Hard ban only for explicit xyr.
+    planning.ground_corner_keepout_radius: 1.5
+    # Omit keepout_xyr when unused — ROS2 rejects empty [] array params.
+    # planning.ground_corner_keepout_xyr: [9.0, -3.0, 1.0]
+    planning.ground_corner_keepout_z_min: -1.0
+    planning.ground_corner_keepout_z_max: 8.0
+    planning.ground_corner_keepout_penalty: 80.0
+    planning.ground_corner_keepout_hard_core_scale: 0.5
+    planning.ground_wall_clearance: 0.6
+    planning.ground_wall_clearance_weight: 30.0
+    planning.ground_climb_penalty: 0.85
+    # Soft prefer staying near start/goal z when they look same-floor. Hard z-band
+    # caused no_path on building2_9 (stair landing ↔ west wing only join upstairs).
+    planning.ground_leave_floor_penalty: 25.0
+    # Optional multi-floor via waypoints (off by default; no map-specific coords).
+    planning.ground_landing_via_enabled: false
+    planning.ground_landing_via_min_dz: 0.7
+    planning.ground_landing_via_radius: 0.8
     planning.uav_endpoint_snap_radius_cells: 12
     planning.enable_dynamic_feasibility_check: false
     planning.dynamic_feasibility_mode: sampled
@@ -29,6 +58,9 @@ nav3d_bridge_node:
     planning.max_dynamic_time_scale: 10.0
     planning.enable_initial_time_allocation: false
     planning.min_time_allocation_interval: 0.05
+
+    imu.topic: /imu
+    imu.use_for_body_attitude: false
 
     map.pcd_path: ""
     map.pcd_loader: builtin

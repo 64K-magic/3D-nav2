@@ -5,3 +5,6 @@ NAV2 3D.xmind.bak
 NAV2 3D.knowledge.bak.xmind
 tools/*.make
 install/*
+# Large local PCD maps (keep offline; exceed GitHub limits)
+tools/testdata/cs01-*.pcd
+tools/testdata/MANIFOLD_*.pcd

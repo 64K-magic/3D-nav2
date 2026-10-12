@@ -34,6 +34,7 @@
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <std_msgs/msg/empty.hpp>
@@ -52,6 +53,7 @@
 #include <octomap_msgs/msg/octomap.hpp>
 #endif
 
+#include "nav3d/collision/footprint_3d.h"
 #include "nav3d/collision/inflation_layer.h"
 #include "nav3d/collision/trajectory_checker.h"
 #include "nav3d/controller/safety_monitor.h"
@@ -92,6 +94,11 @@ struct GroundIndex {
   {
     return x == other.x && y == other.y && z == other.z;
   }
+
+  bool operator!=(const GroundIndex& other) const
+  {
+    return !(*this == other);
+  }
 };
 
 struct GroundIndexHash {
@@ -121,6 +128,12 @@ struct GroundQueueNodeCompare {
   }
 };
 
+struct GroundCornerKeepout {
+  double x = 0.0;
+  double y = 0.0;
+  double radius = 0.0;
+};
+
 struct GroundSearchOptions {
   nav3d::planner::PlanningMode mode = nav3d::planner::PlanningMode::Mode3D;
   int max_iterations = 200000;
@@ -131,6 +144,34 @@ struct GroundSearchOptions {
   double robot_radius = 0.25;
   bool allow_diagonal = true;
   bool strict_direct_ground_support = false;
+  bool footprint_enabled = false;
+  nav3d::collision::Footprint3DConfig footprint =
+    nav3d::collision::makeDefaultDogFootprintConfig();
+  // Soft ring around auto-detected / explicit corners. Hard ban (if any) is
+  // only for explicit keepout_xyr cylinders — see canMoveGround.
+  double corner_keepout_radius = 1.5;
+  double corner_keepout_z_min = -1.0;
+  double corner_keepout_z_max = 8.0;
+  double corner_keepout_height_span_min = 0.5;
+  double corner_keepout_penalty = 80.0;
+  // Used only when corner_keepouts (explicit xyr) is non-empty.
+  double corner_keepout_hard_core_scale = 0.5;
+  std::vector<GroundCornerKeepout> corner_keepouts;
+  // Extra cost when the path centerline is closer than this to occupied walls
+  // (compensates for A* using a sphere while the dog footprint is long/wide).
+  double wall_clearance = 0.6;
+  double wall_clearance_weight = 30.0;
+  // Filled once per A* search — avoids O(radius²·seedTest) per expansion.
+  const std::vector<nav3d::common::Point3D>* auto_corner_seeds = nullptr;
+  // Multi-floor plans: optional via-points (off / empty by default).
+  bool landing_via_enabled = false;
+  double landing_via_min_dz = 0.7;
+  double landing_via_radius = 0.8;
+  std::vector<nav3d::common::Point3D> landing_via_points;
+  double climb_penalty = 0.85;
+  // Soft cost for leaving the start/goal z band when |goal.z-start.z| is small.
+  // Hard z-band caused no_path on building2_9 west wing (L1 islands only join upstairs).
+  double leave_floor_penalty = 25.0;
 };
 
 struct GroundSearchResult {
@@ -251,10 +292,17 @@ bool hasGroundSupport(
 bool hasBodyClearance(
   const nav3d::map::IMap& map,
   const GroundIndex& idx,
-  const GroundSearchOptions& options)
+  const GroundSearchOptions& options,
+  double yaw = 0.0,
+  const std::optional<nav3d::collision::BodyAttitude>& imu_override = std::nullopt)
 {
+  (void)yaw;
+  (void)imu_override;
+  // Oriented footprint is enforced on trajectories / tracking. A* cell filter
+  // keeps the configured sphere radius so stair connectivity stays intact.
   const double resolution = map.getResolution();
-  const int radius_cells = std::max(0, static_cast<int>(std::ceil(options.robot_radius / resolution)));
+  const int radius_cells =
+    std::max(0, static_cast<int>(std::ceil(options.robot_radius / resolution)));
   const double radius_sq = options.robot_radius * options.robot_radius;
   for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
     for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
@@ -275,10 +323,314 @@ bool hasBodyClearance(
   return true;
 }
 
-bool isGroundTraversable(
+bool columnHasOccupied(
+  const nav3d::map::IMap& map,
+  int x,
+  int y,
+  int z_center,
+  double resolution,
+  int z_pad = 2)
+{
+  for (int dz = -z_pad; dz <= z_pad; ++dz) {
+    const auto p = groundIndexToWorld({x, y, z_center + dz}, resolution);
+    if (map.isInBounds(p) && map.isOccupied(p)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool hasNearbySupportHeightSpan(
   const nav3d::map::IMap& map,
   const GroundIndex& idx,
   const GroundSearchOptions& options)
+{
+  const double resolution = map.getResolution();
+  // Cheap stair-context probe: sample a few columns instead of a dense cube.
+  const int step = std::max(1, static_cast<int>(std::lround(0.6 / std::max(1e-6, resolution))));
+  const int offsets[][2] = {
+    {0, 0}, {step, 0}, {-step, 0}, {0, step}, {0, -step},
+    {step, step}, {step, -step}, {-step, step}, {-step, -step},
+  };
+  double z_min = std::numeric_limits<double>::infinity();
+  double z_max = -std::numeric_limits<double>::infinity();
+  for (const auto& offset : offsets) {
+    for (int dz = -step; dz <= step; dz += step) {
+      const GroundIndex candidate{idx.x + offset[0], idx.y + offset[1], idx.z + dz};
+      if (!hasGroundSupport(map, candidate, options)) {
+        continue;
+      }
+      const double z = groundIndexToWorld(candidate, resolution).z;
+      z_min = std::min(z_min, z);
+      z_max = std::max(z_max, z);
+    }
+  }
+  if (!std::isfinite(z_min) || !std::isfinite(z_max)) {
+    return false;
+  }
+  return (z_max - z_min) >= options.corner_keepout_height_span_min;
+}
+
+bool hasStrictConcaveLPattern(
+  const nav3d::map::IMap& map,
+  const GroundIndex& idx,
+  double resolution,
+  int* out_dx = nullptr,
+  int* out_dy = nullptr)
+{
+  const bool n = columnHasOccupied(map, idx.x, idx.y + 1, idx.z, resolution);
+  const bool s = columnHasOccupied(map, idx.x, idx.y - 1, idx.z, resolution);
+  const bool e = columnHasOccupied(map, idx.x + 1, idx.y, idx.z, resolution);
+  const bool w = columnHasOccupied(map, idx.x - 1, idx.y, idx.z, resolution);
+  const int occupied_orth = static_cast<int>(n) + static_cast<int>(s) +
+    static_cast<int>(e) + static_cast<int>(w);
+  if (occupied_orth != 2) {
+    return false;
+  }
+  int dx = 0;
+  int dy = 0;
+  if (n && e) {
+    dx = 1;
+    dy = 1;
+  } else if (e && s) {
+    dx = 1;
+    dy = -1;
+  } else if (s && w) {
+    dx = -1;
+    dy = -1;
+  } else if (w && n) {
+    dx = -1;
+    dy = 1;
+  } else {
+    return false;
+  }
+  if (!columnHasOccupied(map, idx.x + dx, idx.y + dy, idx.z, resolution) ||
+      columnHasOccupied(map, idx.x - dx, idx.y - dy, idx.z, resolution)) {
+    return false;
+  }
+  if (out_dx != nullptr) {
+    *out_dx = dx;
+  }
+  if (out_dy != nullptr) {
+    *out_dy = dy;
+  }
+  return true;
+}
+
+bool isInnerWallCornerSeed(
+  const nav3d::map::IMap& map,
+  const GroundIndex& idx,
+  const GroundSearchOptions& options)
+{
+  // Strict concave corner only. Cheap L-pattern first — height-span is expensive
+  // and used to be first, which made every A* step scan the whole neighborhood.
+  const double resolution = map.getResolution();
+  const auto point = groundIndexToWorld(idx, resolution);
+  if (!map.isInBounds(point) || map.isOccupied(point)) {
+    return false;
+  }
+  if (!hasStrictConcaveLPattern(map, idx, resolution)) {
+    return false;
+  }
+  return hasNearbySupportHeightSpan(map, idx, options);
+}
+
+std::vector<nav3d::common::Point3D> collectAutoCornerSeeds(
+  const nav3d::map::IMap& map,
+  const GroundSearchOptions& options)
+{
+  std::vector<nav3d::common::Point3D> seeds;
+  if (options.corner_keepout_radius <= 1e-9 || options.corner_keepout_penalty <= 0.0) {
+    return seeds;
+  }
+  const double resolution = map.getResolution();
+  const auto bounds = map.getBounds();
+  if (!bounds.valid) {
+    return seeds;
+  }
+  const double z_lo = std::max(bounds.min.z, options.corner_keepout_z_min);
+  const double z_hi = std::min(bounds.max.z, options.corner_keepout_z_max);
+  if (z_hi < z_lo) {
+    return seeds;
+  }
+  const GroundIndex min_idx = worldToGroundIndex({bounds.min.x, bounds.min.y, z_lo}, resolution);
+  const GroundIndex max_idx = worldToGroundIndex({bounds.max.x, bounds.max.y, z_hi}, resolution);
+  seeds.reserve(256);
+  for (int z = min_idx.z; z <= max_idx.z; ++z) {
+    for (int y = min_idx.y; y <= max_idx.y; ++y) {
+      for (int x = min_idx.x; x <= max_idx.x; ++x) {
+        const GroundIndex idx{x, y, z};
+        const auto point = groundIndexToWorld(idx, resolution);
+        if (!map.isInBounds(point) || map.isOccupied(point) || !map.isFree(point)) {
+          continue;
+        }
+        if (!hasStrictConcaveLPattern(map, idx, resolution)) {
+          continue;
+        }
+        if (!hasNearbySupportHeightSpan(map, idx, options)) {
+          continue;
+        }
+        seeds.push_back(point);
+      }
+    }
+  }
+  return seeds;
+}
+
+bool isInExplicitCornerKeepout(
+  const nav3d::common::Point3D& point,
+  const GroundSearchOptions& options)
+{
+  if (point.z < options.corner_keepout_z_min || point.z > options.corner_keepout_z_max) {
+    return false;
+  }
+  for (const auto& keepout : options.corner_keepouts) {
+    if (keepout.radius <= 1e-9) {
+      continue;
+    }
+    const double dx = point.x - keepout.x;
+    const double dy = point.y - keepout.y;
+    if ((dx * dx + dy * dy) < keepout.radius * keepout.radius) {
+      return true;
+    }
+  }
+  return false;
+}
+
+double nearestCornerKeepoutXyDistance(
+  const nav3d::map::IMap& map,
+  const GroundIndex& idx,
+  const GroundSearchOptions& options)
+{
+  const double resolution = map.getResolution();
+  const auto point = groundIndexToWorld(idx, resolution);
+  double best = std::numeric_limits<double>::infinity();
+
+  if (point.z >= options.corner_keepout_z_min && point.z <= options.corner_keepout_z_max) {
+    for (const auto& keepout : options.corner_keepouts) {
+      if (keepout.radius <= 1e-9) {
+        continue;
+      }
+      const double dx = point.x - keepout.x;
+      const double dy = point.y - keepout.y;
+      best = std::min(best, std::sqrt(dx * dx + dy * dy));
+    }
+  }
+
+  if (options.corner_keepout_radius <= 1e-9 ||
+      point.z < options.corner_keepout_z_min ||
+      point.z > options.corner_keepout_z_max) {
+    return best;
+  }
+
+  // Fast path: precomputed seeds (same-floor band |Δz|≤0.6).
+  if (options.auto_corner_seeds != nullptr) {
+    for (const auto& seed : *options.auto_corner_seeds) {
+      if (std::abs(seed.z - point.z) > 0.6) {
+        continue;
+      }
+      const double dx = point.x - seed.x;
+      const double dy = point.y - seed.y;
+      best = std::min(best, std::sqrt(dx * dx + dy * dy));
+    }
+    return best;
+  }
+
+  // Slow fallback (should be rare once search precomputes seeds).
+  if (!hasNearbySupportHeightSpan(map, idx, options)) {
+    return best;
+  }
+  const int radius_cells = std::max(
+    1,
+    static_cast<int>(
+      std::ceil(options.corner_keepout_radius / std::max(1e-6, resolution))));
+  if (isInnerWallCornerSeed(map, idx, options)) {
+    return 0.0;
+  }
+  for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+    for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
+      if (dx == 0 && dy == 0) {
+        continue;
+      }
+      const GroundIndex seed{idx.x + dx, idx.y + dy, idx.z};
+      if (!isInnerWallCornerSeed(map, seed, options)) {
+        continue;
+      }
+      const auto seed_point = groundIndexToWorld(seed, resolution);
+      const double ddx = point.x - seed_point.x;
+      const double ddy = point.y - seed_point.y;
+      best = std::min(best, std::sqrt(ddx * ddx + ddy * ddy));
+    }
+  }
+  return best;
+}
+
+bool isInCornerKeepout(
+  const nav3d::map::IMap& map,
+  const GroundIndex& idx,
+  const GroundSearchOptions& options,
+  double radius_scale = 1.0)
+{
+  const double effective_radius = options.corner_keepout_radius * std::max(0.0, radius_scale);
+  const auto point = groundIndexToWorld(idx, map.getResolution());
+
+  // Explicit cylinders: compare against each cylinder radius * scale.
+  if (!options.corner_keepouts.empty() &&
+      point.z >= options.corner_keepout_z_min &&
+      point.z <= options.corner_keepout_z_max) {
+    for (const auto& keepout : options.corner_keepouts) {
+      if (keepout.radius <= 1e-9) {
+        continue;
+      }
+      const double r = keepout.radius * std::max(0.0, radius_scale);
+      const double dx = point.x - keepout.x;
+      const double dy = point.y - keepout.y;
+      if ((dx * dx + dy * dy) < r * r) {
+        return true;
+      }
+    }
+  }
+
+  if (effective_radius <= 1e-9) {
+    return false;
+  }
+  const double dist = nearestCornerKeepoutXyDistance(map, idx, options);
+  return std::isfinite(dist) && dist < effective_radius;
+}
+
+double nearestOccupiedXyDistance(
+  const nav3d::map::IMap& map,
+  const GroundIndex& idx,
+  double search_radius)
+{
+  const double resolution = map.getResolution();
+  if (search_radius <= 1e-9) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const int radius_cells =
+    std::max(1, static_cast<int>(std::ceil(search_radius / std::max(1e-6, resolution))));
+  double best_sq = std::numeric_limits<double>::infinity();
+  for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+    for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
+      if (dx == 0 && dy == 0) {
+        continue;
+      }
+      if (!columnHasOccupied(map, idx.x + dx, idx.y + dy, idx.z, resolution)) {
+        continue;
+      }
+      const double dist_x = static_cast<double>(dx) * resolution;
+      const double dist_y = static_cast<double>(dy) * resolution;
+      best_sq = std::min(best_sq, dist_x * dist_x + dist_y * dist_y);
+    }
+  }
+  return std::sqrt(best_sq);
+}
+
+bool isGroundTraversable(
+  const nav3d::map::IMap& map,
+  const GroundIndex& idx,
+  const GroundSearchOptions& options,
+  bool /*enforce_corner_keepout*/ = true)
 {
   const auto point = groundIndexToWorld(idx, map.getResolution());
   return map.isFree(point) &&
@@ -341,7 +693,9 @@ GroundIndex resolveGroundIndex(
   const GroundIndex& requested,
   const GroundSearchOptions& options)
 {
-  if (isGroundTraversable(map, requested, options)) {
+  // Endpoints may sit near a stair inner corner; keep-out applies to expansion only.
+  constexpr bool kEnforceKeepout = false;
+  if (isGroundTraversable(map, requested, options, kEnforceKeepout)) {
     return requested;
   }
 
@@ -361,7 +715,7 @@ GroundIndex resolveGroundIndex(
             requested.y + dy,
             requested.z + dz,
           };
-          if (!isGroundTraversable(map, candidate, options)) {
+          if (!isGroundTraversable(map, candidate, options, kEnforceKeepout)) {
             continue;
           }
           const auto snap_candidate =
@@ -408,18 +762,85 @@ std::vector<GroundIndex> makeGroundDirections(
   return directions;
 }
 
+bool isNearGroundEndpoint(
+  const GroundIndex& idx,
+  const GroundIndex& endpoint,
+  double radius_m,
+  double resolution)
+{
+  if (radius_m <= 1e-9) {
+    return false;
+  }
+  const double dx = static_cast<double>(idx.x - endpoint.x) * resolution;
+  const double dy = static_cast<double>(idx.y - endpoint.y) * resolution;
+  const double dz = static_cast<double>(idx.z - endpoint.z) * resolution;
+  // Same-floor escape/entry bubble around snapped start/goal.
+  return (dx * dx + dy * dy) < radius_m * radius_m && std::abs(dz) <= 0.6;
+}
+
 bool canMoveGround(
   const nav3d::map::IMap& map,
   const GroundIndex& from,
   const GroundIndex& direction,
-  const GroundSearchOptions& options)
+  const GroundSearchOptions& options,
+  const GroundIndex* start_idx = nullptr,
+  const GroundIndex* goal_idx = nullptr)
 {
   const GroundIndex target{
     from.x + direction.x,
     from.y + direction.y,
     from.z + direction.z,
   };
+  // Block stairwell corner cuts: any simultaneous horizontal + vertical step
+  // can climb from floor-1 into floor-2 without using the landing. Stairs still
+  // connect via pure vertical then pure horizontal (6-connect) with support radius.
+  if (direction.z != 0 && (direction.x != 0 || direction.y != 0)) {
+    return false;
+  }
   if (!isGroundTraversable(map, target, options)) {
+    return false;
+  }
+
+  // Hard ban applies ONLY to explicit keepout cylinders (keepout_xyr). Auto
+  // L-corner detection stays soft-cost only: hard-banning auto seeds seals
+  // entire stair landings into islands (no_path at ~20-30 iterations).
+  const double resolution = map.getResolution();
+  const double endpoint_exempt_radius = std::max(options.corner_keepout_radius, 1.0);
+  const auto hard_core_blocked = [&](const GroundIndex& idx) {
+    if (options.corner_keepout_hard_core_scale <= 1e-9 || options.corner_keepouts.empty()) {
+      return false;
+    }
+    if (goal_idx != nullptr && idx == *goal_idx) {
+      return false;
+    }
+    if (start_idx != nullptr &&
+        isNearGroundEndpoint(idx, *start_idx, endpoint_exempt_radius, resolution)) {
+      return false;
+    }
+    if (goal_idx != nullptr &&
+        isNearGroundEndpoint(idx, *goal_idx, endpoint_exempt_radius, resolution)) {
+      return false;
+    }
+    const auto point = groundIndexToWorld(idx, resolution);
+    if (point.z < options.corner_keepout_z_min || point.z > options.corner_keepout_z_max) {
+      return false;
+    }
+    const double scale = options.corner_keepout_hard_core_scale;
+    for (const auto& keepout : options.corner_keepouts) {
+      if (keepout.radius <= 1e-9) {
+        continue;
+      }
+      const double core_r = keepout.radius * scale;
+      const double dx = point.x - keepout.x;
+      const double dy = point.y - keepout.y;
+      if ((dx * dx + dy * dy) < core_r * core_r) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (hard_core_blocked(target)) {
     return false;
   }
 
@@ -437,10 +858,90 @@ bool canMoveGround(
         if (!isGroundTraversable(map, intermediate, options)) {
           return false;
         }
+        if (hard_core_blocked(intermediate)) {
+          return false;
+        }
       }
     }
   }
+
+  // Oriented footprint is NOT checked here: the dog box (~1.5m) false-blocks
+  // stair connectivity in A* (no_path in a few thousand iterations). Footprint
+  // is enforced on the smoothed trajectory + tracking instead.
   return true;
+}
+
+double cornerKeepoutSoftExtraCost(
+  const nav3d::map::IMap& map,
+  const GroundIndex& idx,
+  const GroundSearchOptions& options)
+{
+  if (options.corner_keepout_penalty <= 0.0) {
+    return 0.0;
+  }
+  const double resolution = map.getResolution();
+  const auto point = groundIndexToWorld(idx, resolution);
+  double extra = 0.0;
+
+  if (point.z >= options.corner_keepout_z_min && point.z <= options.corner_keepout_z_max) {
+    for (const auto& keepout : options.corner_keepouts) {
+      if (keepout.radius <= 1e-9) {
+        continue;
+      }
+      const double dx = point.x - keepout.x;
+      const double dy = point.y - keepout.y;
+      const double dist = std::sqrt(dx * dx + dy * dy);
+      if (dist < keepout.radius) {
+        const double t = 1.0 - dist / keepout.radius;
+        extra = std::max(extra, options.corner_keepout_penalty * t * t);
+      }
+    }
+  }
+
+  if (options.corner_keepout_radius > 1e-9) {
+    const double dist = nearestCornerKeepoutXyDistance(map, idx, options);
+    // Ignore explicit-only distances when auto radius is the falloff scale: if the
+    // nearest hit is an explicit cylinder already counted above, auto falloff with
+    // corner_keepout_radius still pushes away from L seeds (same query).
+    if (std::isfinite(dist) && dist < options.corner_keepout_radius) {
+      const double t = 1.0 - dist / options.corner_keepout_radius;
+      extra = std::max(extra, options.corner_keepout_penalty * t * t);
+      // Near-seed spike: soft falloff alone still left min_seed_xy≈0.2 on planned
+      // stair turns (centerline OK for 0.25m sphere, long footprint clips railings).
+      // A sharp extra band (~dog half-width) forces outer arcs when an alternate exists.
+      constexpr double kNearSeedSpikeRadius = 0.45;
+      if (dist < kNearSeedSpikeRadius) {
+        const double u = 1.0 - dist / kNearSeedSpikeRadius;
+        extra += options.corner_keepout_penalty * 4.0 * u * u;
+      }
+    }
+  }
+  return extra;
+}
+
+double groundStepCost(
+  const nav3d::map::IMap& map,
+  const GroundIndex& from,
+  const GroundIndex& to,
+  const GroundSearchOptions& options)
+{
+  (void)from;
+  const double geometric = groundIndexDistance(from, to);
+  const int dz = std::abs(to.z - from.z);
+  double cost = geometric + options.climb_penalty * static_cast<double>(dz);
+  // Distance-weighted soft keepout: flat penalty inside the whole landing makes
+  // inner and outer arcs equally expensive, so A* still hugs the railing. Cost
+  // peaks at the L-corner seed and falls to 0 at radius.
+  cost += cornerKeepoutSoftExtraCost(map, to, options);
+  // Wall proximity: keep centerline away from railings for the wide dog body.
+  if (options.wall_clearance_weight > 0.0 && options.wall_clearance > 1e-9) {
+    const double dist = nearestOccupiedXyDistance(map, to, options.wall_clearance);
+    if (std::isfinite(dist) && dist < options.wall_clearance) {
+      const double gap = (options.wall_clearance - dist) / options.wall_clearance;
+      cost += options.wall_clearance_weight * gap * gap;
+    }
+  }
+  return cost;
 }
 
 std::vector<GroundIndex> reconstructGroundPath(
@@ -456,22 +957,61 @@ std::vector<GroundIndex> reconstructGroundPath(
   return path;
 }
 
-GroundSearchResult searchGroundSupportedPath(
-  const nav3d::map::IMap& map,
-  const nav3d::common::Point3D& start,
-  const nav3d::common::Point3D& goal,
-  const GroundSearchOptions& options)
+std::vector<nav3d::common::Point3D> indexPathToWarmStart(
+  const std::vector<GroundIndex>& index_path,
+  double resolution)
 {
-  if (map.getResolution() <= 0.0) {
+  nav3d::common::Path3D path;
+  path.reserve(index_path.size() * kGroundWarmStartMultiplicity);
+  for (const auto& idx : index_path) {
+    const auto point = groundIndexToWorld(idx, resolution);
+    for (int repeat = 0; repeat < kGroundWarmStartMultiplicity; ++repeat) {
+      path.push_back(point);
+    }
+  }
+  return path;
+}
+
+GroundSearchResult searchGroundAStarBetween(
+  const nav3d::map::IMap& map,
+  const GroundIndex& start_idx,
+  const GroundIndex& goal_idx,
+  const GroundSearchOptions& options,
+  double goal_xy_radius = 0.0)
+{
+  if (!isGroundTraversable(map, start_idx, options, false) ||
+      !isGroundTraversable(map, goal_idx, options, false)) {
     return {nav3d::planner::SearchStatus::InvalidInput, {}, 0, 0.0};
   }
 
+  // Precompute strict corner seeds once. Per-expansion neighborhood seed tests
+  // previously hung planning for minutes (needed SIGKILL on Ctrl+C).
+  GroundSearchOptions search_options = options;
+  const auto auto_seeds = collectAutoCornerSeeds(map, options);
+  search_options.auto_corner_seeds = &auto_seeds;
+  RCLCPP_INFO(
+    rclcpp::get_logger("nav3d_bridge_node"),
+    "ground_astar corner_seeds=%zu keepout_r=%.2f penalty=%.1f",
+    auto_seeds.size(),
+    options.corner_keepout_radius,
+    options.corner_keepout_penalty);
+
   const double resolution = map.getResolution();
-  const GroundIndex start_idx = resolveGroundIndex(map, worldToGroundIndex(start, resolution), options);
-  const GroundIndex goal_idx = resolveGroundIndex(map, worldToGroundIndex(goal, resolution), options);
-  if (!isGroundTraversable(map, start_idx, options) || !isGroundTraversable(map, goal_idx, options)) {
-    return {nav3d::planner::SearchStatus::InvalidInput, {}, 0, 0.0};
-  }
+  const auto goal_point = groundIndexToWorld(goal_idx, resolution);
+  const double goal_radius_sq = goal_xy_radius * goal_xy_radius;
+  auto reached_goal = [&](const GroundIndex& idx) {
+    if (idx == goal_idx) {
+      return true;
+    }
+    if (goal_xy_radius <= 1e-9) {
+      return false;
+    }
+    const auto p = groundIndexToWorld(idx, resolution);
+    const double dx = p.x - goal_point.x;
+    const double dy = p.y - goal_point.y;
+    const double dz = p.z - goal_point.z;
+    return (dx * dx + dy * dy) <= goal_radius_sq && std::abs(dz) <= std::max(resolution, 0.35);
+  };
 
   std::priority_queue<GroundQueueNode, std::vector<GroundQueueNode>, GroundQueueNodeCompare> open_set;
   std::unordered_map<GroundIndex, double, GroundIndexHash> g_score;
@@ -480,10 +1020,32 @@ GroundSearchResult searchGroundSupportedPath(
 
   g_score[start_idx] = 0.0;
   open_set.push({start_idx, groundIndexDistance(start_idx, goal_idx), 0.0});
-  const auto directions = makeGroundDirections(options.mode, options.allow_diagonal);
+  const auto directions =
+    makeGroundDirections(search_options.mode, search_options.allow_diagonal);
   int iterations = 0;
 
-  while (!open_set.empty() && iterations < options.max_iterations) {
+  // Prefer staying near start/goal z when they look same-floor, but do not hard-cut:
+  // on building2_9 the stair landing and west wing are separate L1 islands — only
+  // connected upstairs (path z up to ~13.7). A hard band caused no_path with
+  // closed≈2950 while start/goal were both traversable.
+  const auto start_point = groundIndexToWorld(start_idx, resolution);
+  constexpr double kSameFloorDz = 0.6;
+  constexpr double kFloorBandMargin = 0.45;
+  const bool same_floor = std::abs(goal_point.z - start_point.z) <= kSameFloorDz;
+  const double z_band_lo = std::min(start_point.z, goal_point.z) - kFloorBandMargin;
+  const double z_band_hi = std::max(start_point.z, goal_point.z) + kFloorBandMargin;
+  const double leave_floor_pen =
+    same_floor ? std::max(0.0, search_options.leave_floor_penalty) : 0.0;
+  if (same_floor && leave_floor_pen > 1e-9) {
+    RCLCPP_INFO(
+      rclcpp::get_logger("nav3d_bridge_node"),
+      "ground_astar same_floor_soft_z=[%.2f,%.2f] leave_floor_penalty=%.1f",
+      z_band_lo,
+      z_band_hi,
+      leave_floor_pen);
+  }
+
+  while (!open_set.empty() && iterations < search_options.max_iterations) {
     const auto current = open_set.top();
     open_set.pop();
     ++iterations;
@@ -497,17 +1059,84 @@ GroundSearchResult searchGroundSupportedPath(
     }
     closed_set.insert(current.idx);
 
-    if (current.idx == goal_idx) {
+    if (reached_goal(current.idx)) {
       const auto index_path = reconstructGroundPath(came_from, current.idx);
-      nav3d::common::Path3D path;
-      path.reserve(index_path.size() * kGroundWarmStartMultiplicity);
+      int soft_hits = 0;
+      int near_seed_hits = 0;
+      int explicit_hard_hits = 0;
+      int near_wall = 0;
+      int leave_floor_cells = 0;
+      double min_wall = std::numeric_limits<double>::infinity();
+      double min_seed = std::numeric_limits<double>::infinity();
+      double soft_cost_sum = 0.0;
+      double path_z_min = std::numeric_limits<double>::infinity();
+      double path_z_max = -std::numeric_limits<double>::infinity();
+      constexpr double kNearSeedReportRadius = 0.45;
       for (const auto& idx : index_path) {
-        const auto point = groundIndexToWorld(idx, resolution);
-        for (int repeat = 0; repeat < kGroundWarmStartMultiplicity; ++repeat) {
-          path.push_back(point);
+        const auto wp = groundIndexToWorld(idx, resolution);
+        path_z_min = std::min(path_z_min, wp.z);
+        path_z_max = std::max(path_z_max, wp.z);
+        if (same_floor && (wp.z < z_band_lo || wp.z > z_band_hi)) {
+          ++leave_floor_cells;
+        }
+        const double soft_extra = cornerKeepoutSoftExtraCost(map, idx, search_options);
+        soft_cost_sum += soft_extra;
+        if (soft_extra > 1e-6) {
+          ++soft_hits;
+        }
+        // Explicit hard-core only (auto L stays soft). Old "hard_core=" counted
+        // auto seeds at hard_core_scale and looked like a ban that does not exist.
+        if (!search_options.corner_keepouts.empty() &&
+            search_options.corner_keepout_hard_core_scale > 1e-9 &&
+            isInCornerKeepout(
+              map, idx, search_options, search_options.corner_keepout_hard_core_scale)) {
+          ++explicit_hard_hits;
+        }
+        const double seed_dist = nearestCornerKeepoutXyDistance(map, idx, search_options);
+        if (std::isfinite(seed_dist)) {
+          min_seed = std::min(min_seed, seed_dist);
+          if (seed_dist < kNearSeedReportRadius) {
+            ++near_seed_hits;
+          }
+        }
+        const double wall_dist = nearestOccupiedXyDistance(
+          map, idx, std::max(search_options.wall_clearance, 1.0));
+        if (std::isfinite(wall_dist)) {
+          min_wall = std::min(min_wall, wall_dist);
+          if (wall_dist < search_options.wall_clearance) {
+            ++near_wall;
+          }
         }
       }
+      auto path = indexPathToWarmStart(index_path, resolution);
       const double cost = pathLength(path);
+      RCLCPP_INFO(
+        rclcpp::get_logger("nav3d_bridge_node"),
+        "ground_astar path_cells=%zu soft_hits=%d soft_cost_avg=%.2f min_seed_xy=%.2f "
+        "near_seed=%d explicit_hard=%d near_wall=%d min_wall_xy=%.2f z=[%.2f,%.2f] "
+        "leave_floor=%d cost=%.2f iters=%d",
+        index_path.size(),
+        soft_hits,
+        index_path.empty() ? 0.0 : soft_cost_sum / static_cast<double>(index_path.size()),
+        std::isfinite(min_seed) ? min_seed : -1.0,
+        near_seed_hits,
+        explicit_hard_hits,
+        near_wall,
+        std::isfinite(min_wall) ? min_wall : -1.0,
+        path_z_min,
+        path_z_max,
+        leave_floor_cells,
+        cost,
+        iterations);
+      if (leave_floor_cells > 0) {
+        RCLCPP_WARN(
+          rclcpp::get_logger("nav3d_bridge_node"),
+          "ground_astar same_floor_endpoints_require_climb leave_floor_cells=%d "
+          "z=[%.2f,%.2f] (L1 islands not connected on this map)",
+          leave_floor_cells,
+          path_z_min,
+          path_z_max);
+      }
       return {nav3d::planner::SearchStatus::Success, std::move(path), iterations, cost};
     }
 
@@ -518,26 +1147,166 @@ GroundSearchResult searchGroundSupportedPath(
         current.idx.z + direction.z,
       };
       if (closed_set.find(neighbor) != closed_set.end() ||
-          !canMoveGround(map, current.idx, direction, options)) {
+          !canMoveGround(
+            map, current.idx, direction, search_options, &start_idx, &goal_idx)) {
         continue;
       }
-      const double tentative_g = current.g + groundIndexDistance(current.idx, neighbor);
+      double step = groundStepCost(map, current.idx, neighbor, search_options);
+      if (leave_floor_pen > 1e-9) {
+        const double nz = groundIndexToWorld(neighbor, resolution).z;
+        if (nz < z_band_lo) {
+          step += leave_floor_pen * (z_band_lo - nz) / std::max(resolution, 1e-6);
+        } else if (nz > z_band_hi) {
+          step += leave_floor_pen * (nz - z_band_hi) / std::max(resolution, 1e-6);
+        }
+      }
+      const double tentative_g = current.g + step;
       const auto existing = g_score.find(neighbor);
       if (existing == g_score.end() || tentative_g < existing->second) {
         came_from[neighbor] = current.idx;
         g_score[neighbor] = tentative_g;
-        open_set.push({neighbor, tentative_g + groundIndexDistance(neighbor, goal_idx), tentative_g});
+        open_set.push(
+          {neighbor, tentative_g + groundIndexDistance(neighbor, goal_idx), tentative_g});
       }
     }
   }
 
+  const bool start_soft = isInCornerKeepout(map, start_idx, search_options);
+  const bool goal_soft = isInCornerKeepout(map, goal_idx, search_options);
+  const bool start_ok = isGroundTraversable(map, start_idx, search_options);
+  const bool goal_ok = isGroundTraversable(map, goal_idx, search_options);
+  RCLCPP_WARN(
+    rclcpp::get_logger("nav3d_bridge_node"),
+    "ground_astar no_path iters=%d closed=%zu start_trav=%d goal_trav=%d "
+    "start_soft_keepout=%d goal_soft_keepout=%d robot_r=%.2f seeds=%zu",
+    iterations,
+    closed_set.size(),
+    start_ok ? 1 : 0,
+    goal_ok ? 1 : 0,
+    start_soft ? 1 : 0,
+    goal_soft ? 1 : 0,
+    search_options.robot_radius,
+    auto_seeds.size());
   return {
-    iterations >= options.max_iterations
+    iterations >= search_options.max_iterations
       ? nav3d::planner::SearchStatus::IterationLimit
       : nav3d::planner::SearchStatus::NoPath,
     {},
     iterations,
     0.0,
+  };
+}
+
+std::vector<nav3d::common::Point3D> selectLandingViaPoints(
+  const nav3d::common::Point3D& start,
+  const nav3d::common::Point3D& goal,
+  const GroundSearchOptions& options)
+{
+  if (!options.landing_via_enabled || options.landing_via_points.empty()) {
+    return {};
+  }
+  if (std::abs(goal.z - start.z) < options.landing_via_min_dz) {
+    return {};
+  }
+
+  // Keep vias whose height sits between start/goal (with small margin), ordered
+  // by climb direction so we visit landings bottom→top or top→bottom.
+  const double z_lo = std::min(start.z, goal.z) + 0.15;
+  const double z_hi = std::max(start.z, goal.z) - 0.15;
+  std::vector<nav3d::common::Point3D> selected;
+  for (const auto& via : options.landing_via_points) {
+    if (via.z < z_lo || via.z > z_hi) {
+      continue;
+    }
+    selected.push_back(via);
+  }
+  if (selected.empty()) {
+    // Fall back to all configured vias if none lie strictly between floors.
+    selected = options.landing_via_points;
+  }
+  const bool climbing = goal.z >= start.z;
+  std::sort(
+    selected.begin(),
+    selected.end(),
+    [climbing](const nav3d::common::Point3D& a, const nav3d::common::Point3D& b) {
+      return climbing ? (a.z < b.z) : (a.z > b.z);
+    });
+  return selected;
+}
+
+GroundSearchResult searchGroundSupportedPath(
+  const nav3d::map::IMap& map,
+  const nav3d::common::Point3D& start,
+  const nav3d::common::Point3D& goal,
+  const GroundSearchOptions& options)
+{
+  if (map.getResolution() <= 0.0) {
+    return {nav3d::planner::SearchStatus::InvalidInput, {}, 0, 0.0};
+  }
+
+  const double resolution = map.getResolution();
+  const GroundIndex start_idx = resolveGroundIndex(map, worldToGroundIndex(start, resolution), options);
+  const GroundIndex goal_idx = resolveGroundIndex(map, worldToGroundIndex(goal, resolution), options);
+  if (!isGroundTraversable(map, start_idx, options, false) ||
+      !isGroundTraversable(map, goal_idx, options, false)) {
+    return {nav3d::planner::SearchStatus::InvalidInput, {}, 0, 0.0};
+  }
+
+  const auto vias = selectLandingViaPoints(start, goal, options);
+  if (vias.empty()) {
+    return searchGroundAStarBetween(map, start_idx, goal_idx, options);
+  }
+
+  nav3d::common::Path3D combined;
+  int total_iterations = 0;
+  double total_cost = 0.0;
+  GroundIndex current_idx = start_idx;
+  auto append_leg = [&](const GroundSearchResult& leg) {
+    total_iterations += leg.iterations;
+    total_cost += leg.path_cost;
+    if (leg.path.empty()) {
+      return;
+    }
+    if (combined.empty()) {
+      combined = leg.path;
+      return;
+    }
+    // Skip duplicated junction waypoint warm-start repeats.
+    combined.insert(combined.end(), leg.path.begin() + 1, leg.path.end());
+  };
+
+  for (const auto& via : vias) {
+    const GroundIndex via_idx = resolveGroundIndex(map, worldToGroundIndex(via, resolution), options);
+    // Skip vias that collapse onto the current endpoint.
+    if (via_idx == current_idx) {
+      continue;
+    }
+    const auto leg = searchGroundAStarBetween(
+      map, current_idx, via_idx, options, options.landing_via_radius);
+    if (leg.status != nav3d::planner::SearchStatus::Success) {
+      // Via unreachable: fall back to direct search rather than failing hard.
+      return searchGroundAStarBetween(map, start_idx, goal_idx, options);
+    }
+    append_leg(leg);
+    current_idx = via_idx;
+  }
+
+  if (current_idx != goal_idx) {
+    const auto last = searchGroundAStarBetween(map, current_idx, goal_idx, options);
+    if (last.status != nav3d::planner::SearchStatus::Success) {
+      return searchGroundAStarBetween(map, start_idx, goal_idx, options);
+    }
+    append_leg(last);
+  }
+
+  if (combined.empty()) {
+    return searchGroundAStarBetween(map, start_idx, goal_idx, options);
+  }
+  return {
+    nav3d::planner::SearchStatus::Success,
+    std::move(combined),
+    total_iterations,
+    total_cost > 0.0 ? total_cost : pathLength(combined),
   };
 }
 
@@ -650,6 +1419,8 @@ private:
     if (!hasGroundSupportAt(idx)) {
       return false;
     }
+    // Corner keep-out is an A* soft cost, not a hard free-space block.
+    // Hard-blocking here isolates stair landings into no_path islands.
     return hasBodyClearanceAt(idx);
   }
 
@@ -947,6 +1718,9 @@ public:
     planning_occupied_markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "/nav3d/planning_occupied_markers",
       latched_visualization_qos);
+    footprint_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>(
+      "/nav3d/footprint_marker",
+      latched_visualization_qos);
 #ifdef NAV3D_HAS_OCTOMAP_MSGS
     octomap_pub_ = create_publisher<octomap_msgs::msg::Octomap>(
       "/octomap",
@@ -1095,6 +1869,13 @@ public:
         onClickedPoint(*msg);
       },
       planning_sub_options);
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+      imu_topic_,
+      50,
+      [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
+        onImu(*msg);
+      },
+      control_sub_options);
     plan_service_ = create_service<GetPlan>(
       "/nav3d/plan_path",
       [this](
@@ -1395,6 +2176,144 @@ private:
       declare_parameter<bool>(
         "planning.ground_strict_direct_support",
         ground_search_options_.strict_direct_ground_support);
+    ground_search_options_.footprint_enabled =
+      declare_parameter<bool>("planning.ground_footprint_enabled", false);
+    ground_search_options_.footprint.body_clearance =
+      declare_parameter<double>(
+        "planning.ground_body_clearance",
+        ground_search_options_.footprint.body_clearance);
+    ground_search_options_.footprint.body_height =
+      declare_parameter<double>(
+        "planning.ground_body_height",
+        ground_search_options_.footprint.body_height);
+    ground_search_options_.footprint.max_pitch_rad =
+      declare_parameter<double>(
+        "planning.ground_max_pitch_rad",
+        ground_search_options_.footprint.max_pitch_rad);
+    ground_search_options_.footprint.terrain_ignore_margin =
+      declare_parameter<double>(
+        "planning.ground_terrain_ignore_margin",
+        ground_search_options_.footprint.terrain_ignore_margin);
+    ground_search_options_.footprint.sample_step =
+      declare_parameter<double>(
+        "planning.ground_footprint_sample_step",
+        ground_search_options_.footprint.sample_step);
+    ground_search_options_.corner_keepout_radius =
+      declare_parameter<double>(
+        "planning.ground_corner_keepout_radius",
+        ground_search_options_.corner_keepout_radius);
+    ground_search_options_.corner_keepout_z_min =
+      declare_parameter<double>(
+        "planning.ground_corner_keepout_z_min",
+        ground_search_options_.corner_keepout_z_min);
+    ground_search_options_.corner_keepout_z_max =
+      declare_parameter<double>(
+        "planning.ground_corner_keepout_z_max",
+        ground_search_options_.corner_keepout_z_max);
+    ground_search_options_.corner_keepout_height_span_min =
+      declare_parameter<double>(
+        "planning.ground_corner_keepout_height_span_min",
+        ground_search_options_.corner_keepout_height_span_min);
+    ground_search_options_.corner_keepout_penalty =
+      declare_parameter<double>(
+        "planning.ground_corner_keepout_penalty",
+        ground_search_options_.corner_keepout_penalty);
+    ground_search_options_.corner_keepout_hard_core_scale =
+      declare_parameter<double>(
+        "planning.ground_corner_keepout_hard_core_scale",
+        ground_search_options_.corner_keepout_hard_core_scale);
+    ground_search_options_.wall_clearance =
+      declare_parameter<double>(
+        "planning.ground_wall_clearance",
+        ground_search_options_.wall_clearance);
+    ground_search_options_.wall_clearance_weight =
+      declare_parameter<double>(
+        "planning.ground_wall_clearance_weight",
+        ground_search_options_.wall_clearance_weight);
+    ground_search_options_.climb_penalty =
+      declare_parameter<double>(
+        "planning.ground_climb_penalty",
+        ground_search_options_.climb_penalty);
+    ground_search_options_.leave_floor_penalty =
+      declare_parameter<double>(
+        "planning.ground_leave_floor_penalty",
+        ground_search_options_.leave_floor_penalty);
+    ground_search_options_.landing_via_enabled =
+      declare_parameter<bool>(
+        "planning.ground_landing_via_enabled",
+        ground_search_options_.landing_via_enabled);
+    ground_search_options_.landing_via_min_dz =
+      declare_parameter<double>(
+        "planning.ground_landing_via_min_dz",
+        ground_search_options_.landing_via_min_dz);
+    ground_search_options_.landing_via_radius =
+      declare_parameter<double>(
+        "planning.ground_landing_via_radius",
+        ground_search_options_.landing_via_radius);
+    {
+      // ROS2 cannot load empty YAML arrays (`key: []`) — omit the key instead.
+      std::vector<double> keepout_xyr;
+      if (has_parameter("planning.ground_corner_keepout_xyr")) {
+        keepout_xyr = get_parameter("planning.ground_corner_keepout_xyr").as_double_array();
+      } else {
+        keepout_xyr = declare_parameter<std::vector<double>>(
+          "planning.ground_corner_keepout_xyr", std::vector<double>{});
+      }
+      if ((keepout_xyr.size() % 3) != 0) {
+        throw std::invalid_argument(
+          "planning.ground_corner_keepout_xyr must contain interleaved x,y,radius triples");
+      }
+      ground_search_options_.corner_keepouts.clear();
+      ground_search_options_.corner_keepouts.reserve(keepout_xyr.size() / 3);
+      for (std::size_t i = 0; i + 2 < keepout_xyr.size(); i += 3) {
+        if (!(keepout_xyr[i + 2] > 0.0) || !std::isfinite(keepout_xyr[i + 2])) {
+          throw std::invalid_argument(
+            "planning.ground_corner_keepout_xyr radius must be positive and finite");
+        }
+        ground_search_options_.corner_keepouts.push_back(
+          {keepout_xyr[i], keepout_xyr[i + 1], keepout_xyr[i + 2]});
+      }
+    }
+    {
+      // Optional; omit from yaml when unused (ROS2 rejects empty [] arrays).
+      std::vector<double> via_xyz;
+      if (has_parameter("planning.ground_landing_via_points")) {
+        via_xyz = get_parameter("planning.ground_landing_via_points").as_double_array();
+      } else {
+        via_xyz = declare_parameter<std::vector<double>>(
+          "planning.ground_landing_via_points", std::vector<double>{});
+      }
+      if ((via_xyz.size() % 3) != 0) {
+        throw std::invalid_argument(
+          "planning.ground_landing_via_points must contain interleaved x,y,z triples");
+      }
+      ground_search_options_.landing_via_points.clear();
+      ground_search_options_.landing_via_points.reserve(via_xyz.size() / 3);
+      for (std::size_t i = 0; i + 2 < via_xyz.size(); i += 3) {
+        ground_search_options_.landing_via_points.push_back(
+          {via_xyz[i], via_xyz[i + 1], via_xyz[i + 2]});
+      }
+    }
+    {
+      const auto default_xy = std::vector<double>{
+        -0.67, -0.4, -0.67, 0.4, 0.87, 0.4, 0.87, -0.4};
+      const auto footprint_xy =
+        declare_parameter<std::vector<double>>("planning.ground_footprint_xy", default_xy);
+      if (footprint_xy.size() < 6 || (footprint_xy.size() % 2) != 0) {
+        throw std::invalid_argument(
+          "planning.ground_footprint_xy must contain interleaved x,y pairs (>= 3 vertices)");
+      }
+      ground_search_options_.footprint.polygon.clear();
+      ground_search_options_.footprint.polygon.reserve(footprint_xy.size() / 2);
+      for (std::size_t i = 0; i + 1 < footprint_xy.size(); i += 2) {
+        ground_search_options_.footprint.polygon.push_back(
+          {footprint_xy[i], footprint_xy[i + 1]});
+      }
+      nav3d::collision::validateFootprint3DConfig(ground_search_options_.footprint);
+    }
+    imu_topic_ = declare_parameter<std::string>("imu.topic", "/imu");
+    imu_use_for_body_attitude_ =
+      declare_parameter<bool>("imu.use_for_body_attitude", false);
     uav_endpoint_snap_radius_cells_ =
       declare_parameter<int>(
         "planning.uav_endpoint_snap_radius_cells",
@@ -1456,6 +2375,51 @@ private:
         ground_search_options_.robot_radius < 0.0) {
       throw std::invalid_argument("planning.ground_robot_radius must be non-negative and finite");
     }
+    if (!std::isfinite(ground_search_options_.corner_keepout_radius) ||
+        ground_search_options_.corner_keepout_radius < 0.0) {
+      throw std::invalid_argument(
+        "planning.ground_corner_keepout_radius must be non-negative and finite");
+    }
+    if (!std::isfinite(ground_search_options_.corner_keepout_penalty) ||
+        ground_search_options_.corner_keepout_penalty < 0.0) {
+      throw std::invalid_argument(
+        "planning.ground_corner_keepout_penalty must be non-negative and finite");
+    }
+    if (!std::isfinite(ground_search_options_.corner_keepout_hard_core_scale) ||
+        ground_search_options_.corner_keepout_hard_core_scale < 0.0 ||
+        ground_search_options_.corner_keepout_hard_core_scale > 1.0) {
+      throw std::invalid_argument(
+        "planning.ground_corner_keepout_hard_core_scale must be in [0, 1]");
+    }
+    if (!std::isfinite(ground_search_options_.wall_clearance) ||
+        ground_search_options_.wall_clearance < 0.0) {
+      throw std::invalid_argument(
+        "planning.ground_wall_clearance must be non-negative and finite");
+    }
+    if (!std::isfinite(ground_search_options_.wall_clearance_weight) ||
+        ground_search_options_.wall_clearance_weight < 0.0) {
+      throw std::invalid_argument(
+        "planning.ground_wall_clearance_weight must be non-negative and finite");
+    }
+    if (!std::isfinite(ground_search_options_.climb_penalty) ||
+        ground_search_options_.climb_penalty < 0.0) {
+      throw std::invalid_argument("planning.ground_climb_penalty must be non-negative and finite");
+    }
+    if (!std::isfinite(ground_search_options_.leave_floor_penalty) ||
+        ground_search_options_.leave_floor_penalty < 0.0) {
+      throw std::invalid_argument(
+        "planning.ground_leave_floor_penalty must be non-negative and finite");
+    }
+    if (!std::isfinite(ground_search_options_.landing_via_min_dz) ||
+        ground_search_options_.landing_via_min_dz < 0.0) {
+      throw std::invalid_argument(
+        "planning.ground_landing_via_min_dz must be non-negative and finite");
+    }
+    if (!std::isfinite(ground_search_options_.landing_via_radius) ||
+        ground_search_options_.landing_via_radius < 0.0) {
+      throw std::invalid_argument(
+        "planning.ground_landing_via_radius must be non-negative and finite");
+    }
     if (config.optimizer.interval <= 0.0) {
       throw std::invalid_argument("optimizer.interval must be positive");
     }
@@ -1483,6 +2447,11 @@ private:
     if (uav_endpoint_snap_radius_cells_ < 0) {
       throw std::invalid_argument("planning.uav_endpoint_snap_radius_cells must be non-negative");
     }
+    // Ground: never cubic-smooth the supported A* polyline — smoothness chords
+    // L1→L2 through the stairwell and invents a pitch that jams the body box.
+    if (planning_traversability_mode_ == PlanningTraversabilityMode::Ground) {
+      config.prefer_path_following_trajectory = true;
+    }
     return config;
   }
 
@@ -1509,7 +2478,13 @@ private:
     projection_options.max_z = occupancy_grid_max_z_;
     std::optional<GroundTraversabilityMap> ground_traversability_map;
     if (planning_traversability_mode_ == PlanningTraversabilityMode::Ground) {
-      ground_traversability_map.emplace(*map_, ground_search_options_);
+      // Visualization only: skip corner keep-out. Auto L-corner detection is
+      // far too expensive to run per cell while projecting the full 2D grid
+      // (would stall startup so RViz never receives map markers).
+      auto viz_options = ground_search_options_;
+      viz_options.corner_keepout_radius = 0.0;
+      viz_options.corner_keepouts.clear();
+      ground_traversability_map.emplace(*map_, std::move(viz_options));
       projection_options.free_cell_z = occupancy_grid_min_z_ + map_->getResolution() * 0.5;
       projection_options.is_free_cell =
         [&ground_traversability_map](const nav3d::common::Point3D& point) {
@@ -2073,20 +3048,33 @@ private:
 
     const double resolution = planning_map.getResolution();
     const auto requested_idx = worldToGroundIndex(requested, resolution);
+    // Endpoints must snap even near stair inner corners; keep-out applies to
+    // path expansion, not to placing start/goal (RViz 2D tools always send z=0
+    // into floor voxels).
+    constexpr bool kEnforceKeepout = false;
     auto try_idx = [&](const GroundIndex& idx) -> std::optional<nav3d::common::Point3D> {
-      if (!isGroundTraversable(planning_map, idx, ground_search_options_)) {
+      if (!isGroundTraversable(planning_map, idx, ground_search_options_, kEnforceKeepout)) {
         return std::nullopt;
       }
       return groundIndexToWorld(idx, resolution);
     };
 
-    // Keep an already-valid tread click (do not lift z=0.3 → 0.5).
-    if (auto p = try_idx(requested_idx)) {
-      return *p;
+    const auto requested_world = groundIndexToWorld(requested_idx, resolution);
+    const bool requested_occupied =
+      planning_map.isInBounds(requested_world) && planning_map.isOccupied(requested_world);
+
+    // Keep an already-valid free tread click (do not lift z=0.3 → 0.5).
+    // Never accept an occupied voxel as "valid" — RViz Pose Estimate / Nav2 Goal
+    // publish z=0 which lands inside the floor slab.
+    if (!requested_occupied) {
+      if (auto p = try_idx(requested_idx)) {
+        return *p;
+      }
     }
 
-    // Prefer the first tread above the click, then a small XY ring at that height.
-    for (int dz = 1; dz <= 4; ++dz) {
+    // Prefer the first free tread above the click (typical RViz z=0 → stance).
+    constexpr int kMaxLiftCells = 8;
+    for (int dz = 1; dz <= kMaxLiftCells; ++dz) {
       if (auto p = try_idx({requested_idx.x, requested_idx.y, requested_idx.z + dz})) {
         return *p;
       }
@@ -2108,6 +3096,14 @@ private:
     if (auto p = try_idx(resolved_idx)) {
       return *p;
     }
+
+    RCLCPP_WARN(
+      get_logger(),
+      "ground_endpoint_snap_failed requested=%.3f,%.3f,%.3f (still inside/near occupied); "
+      "increase planning.ground_snap_radius_cells",
+      requested.x,
+      requested.y,
+      requested.z);
     return requested;
   }
 
@@ -2629,9 +3625,32 @@ private:
     const nav3d::common::Point3D& goal)
   {
     pruneExpiredLocalObservations();
-    return makePlanningMap([&](const nav3d::map::IMap& planning_map) {
+    auto result = makePlanningMap([&](const nav3d::map::IMap& planning_map) {
       return planner_->planWithFallbacks(planning_map, start, goal);
     });
+    if (result.success &&
+        groundTraversabilityEnabled() &&
+        ground_search_options_.footprint_enabled) {
+      const auto footprint_hit = checkTrajectoryFootprint(result.trajectory);
+      if (footprint_hit.in_collision) {
+        // Do not discard the geometric path: stair risers still false-positive
+        // often. Publish warning + pitched markers; tracking hard-stops if the
+        // body truly clips a corner.
+        std::ostringstream warn;
+        warn << "plan_footprint_warning";
+        if (footprint_hit.first_collision_time.has_value()) {
+          warn << " time=" << *footprint_hit.first_collision_time;
+        }
+        if (footprint_hit.first_collision_point.has_value()) {
+          warn << " point=" << footprint_hit.first_collision_point->x << ","
+               << footprint_hit.first_collision_point->y << ","
+               << footprint_hit.first_collision_point->z;
+        }
+        publishStatus(warn.str());
+        RCLCPP_WARN(get_logger(), "%s", warn.str().c_str());
+      }
+    }
+    return result;
   }
 
   nav3d::controller::SafetyDecision evaluateSafetyWithActiveMap(
@@ -3065,6 +4084,55 @@ private:
       }
     }
 
+    if (groundTraversabilityEnabled() && ground_search_options_.footprint_enabled) {
+      publishCurrentFootprintMarker();
+      const bool footprint_hit = makeCollisionPlanningMap(
+        [&](const nav3d::map::IMap& occupancy_map) {
+          const nav3d::collision::Footprint3DChecker checker(ground_search_options_.footprint);
+          double yaw = current_yaw_.value_or(0.0);
+          double path_dz = 0.0;
+          double path_ds = 0.0;
+          if (active_trajectory_.has_value()) {
+            const double duration = active_trajectory_->duration();
+            const double t = std::clamp(tracking_path_time_.value_or(0.0), 0.0, duration);
+            const double t0 = std::max(0.0, t - 0.5);
+            const double t1 = std::min(duration, t + 0.5);
+            const auto a = active_trajectory_->evaluate(t0);
+            const auto b = active_trajectory_->evaluate(t1);
+            path_dz = b.z - a.z;
+            path_ds = std::hypot(b.x - a.x, b.y - a.y);
+            if (path_ds > 1e-4) {
+              yaw = std::atan2(b.y - a.y, b.x - a.x);
+            }
+          }
+          return checker
+            .checkAtPose(
+              occupancy_map,
+              *current_position_,
+              yaw,
+              imuAttitudeOverride(),
+              path_dz,
+              path_ds)
+            .in_collision;
+        });
+      if (footprint_hit) {
+        last_controller_command_.reset();
+        publishZeroCommand("tracking_footprint_collision");
+        publishStatus("tracking_footprint_collision");
+        const auto& p = *current_position_;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(),
+          *get_clock(),
+          1000,
+          "tracking_footprint_collision: holding cmd_vel pose=%.3f,%.3f,%.3f path_t=%.2f",
+          p.x,
+          p.y,
+          p.z,
+          tracking_path_time_.value_or(-1.0));
+        return;
+      }
+    }
+
     // Optional hard block against commanding into raw occupied voxels.
     // Off by default for ground mode: stair B-spline chords clip risers, and
     // zeroing cmd_vel there leaves the robot stuck at the stair mouth.
@@ -3223,6 +4291,301 @@ private:
     last_published_pose_count_ = path.poses.size();
     trajectory_pub_->publish(path);
     publishTrajectoryMarker(path);
+    publishFootprintMarkerAlongTrajectory(result.trajectory);
+  }
+
+  std::optional<nav3d::collision::BodyAttitude> imuAttitudeOverride() const
+  {
+    if (!imu_use_for_body_attitude_ || !imu_attitude_.has_value() || !imu_attitude_->from_imu) {
+      return std::nullopt;
+    }
+    return imu_attitude_;
+  }
+
+  void onImu(const sensor_msgs::msg::Imu& msg)
+  {
+    const auto& q = msg.orientation;
+    const double norm_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    if (norm_sq < 1e-12 || !std::isfinite(norm_sq)) {
+      return;
+    }
+    // ZYX yaw-pitch-roll from quaternion.
+    const double sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z);
+    const double cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y);
+    const double sinp = 2.0 * (q.w * q.y - q.z * q.x);
+    const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+    const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+
+    nav3d::collision::BodyAttitude attitude;
+    attitude.from_imu = true;
+    attitude.roll = std::atan2(sinr_cosp, cosr_cosp);
+    attitude.pitch = std::abs(sinp) >= 1.0 ? std::copysign(M_PI / 2.0, sinp) : std::asin(sinp);
+    attitude.yaw = std::atan2(siny_cosp, cosy_cosp);
+    imu_attitude_ = attitude;
+  }
+
+  nav3d::collision::TrajectoryCollisionResult checkTrajectoryFootprint(
+    const nav3d::planner::UniformBspline& trajectory) const
+  {
+    nav3d::collision::TrajectoryCollisionResult result;
+    if (!ground_search_options_.footprint_enabled) {
+      return result;
+    }
+
+    const double duration = trajectory.duration();
+    if (duration <= 0.0 || !std::isfinite(duration)) {
+      return result;
+    }
+
+    const nav3d::collision::Footprint3DChecker checker(ground_search_options_.footprint);
+    const auto imu = imuAttitudeOverride();
+    return makeCollisionPlanningMap([&](const nav3d::map::IMap& occupancy_map) {
+      nav3d::collision::TrajectoryCollisionResult local;
+      const double dt = std::max(0.08, publish_sample_dt_ * 2.0);
+      // Window ~ half wheelbase along the path for stair-parallel pitch.
+      const double pitch_window = 0.5;
+      auto attitudeAt = [&](double t, double yaw_hint) {
+        const double t0 = std::max(0.0, t - pitch_window);
+        const double t1 = std::min(duration, t + pitch_window);
+        const auto a = trajectory.evaluate(t0);
+        const auto b = trajectory.evaluate(t1);
+        const double dx = b.x - a.x;
+        const double dy = b.y - a.y;
+        const double ds = std::hypot(dx, dy);
+        double yaw = yaw_hint;
+        if (ds > 1e-4) {
+          yaw = std::atan2(dy, dx);
+        }
+        const auto point = trajectory.evaluate(t);
+        return nav3d::collision::estimateBodyAttitude(
+          occupancy_map,
+          point,
+          yaw,
+          b.z - a.z,
+          ds,
+          ground_search_options_.footprint,
+          imu);
+      };
+
+      auto yawAt = [&](double t) {
+        const double t1 = std::min(duration, t + dt);
+        const auto p0 = trajectory.evaluate(t);
+        const auto p1 = trajectory.evaluate(t1);
+        const double ds = std::hypot(p1.x - p0.x, p1.y - p0.y);
+        if (ds < 1e-4) {
+          return 0.0;
+        }
+        return std::atan2(p1.y - p0.y, p1.x - p0.x);
+      };
+
+      double prev_yaw = yawAt(0.0);
+      for (double t = 0.0; t <= duration + 1e-9; t += dt) {
+        const double tc = std::min(t, duration);
+        const auto point = trajectory.evaluate(tc);
+        const double yaw = yawAt(tc);
+        const auto attitude = attitudeAt(tc, yaw);
+        const auto hit = checker.check(occupancy_map, point, attitude);
+        if (hit.in_collision) {
+          local.in_collision = true;
+          local.first_collision_time = tc;
+          local.first_collision_point = hit.hit_point;
+          return local;
+        }
+
+        // Stair landings / corners: sweep intermediate yaw while turning so the
+        // long body does not cut the inside of the stairwell.
+        double dyaw = yaw - prev_yaw;
+        while (dyaw > M_PI) {
+          dyaw -= 2.0 * M_PI;
+        }
+        while (dyaw < -M_PI) {
+          dyaw += 2.0 * M_PI;
+        }
+        const int yaw_samples = static_cast<int>(std::ceil(std::abs(dyaw) / (15.0 * M_PI / 180.0)));
+        for (int i = 1; i < yaw_samples; ++i) {
+          const double alpha = static_cast<double>(i) / static_cast<double>(yaw_samples);
+          nav3d::collision::BodyAttitude turned = attitude;
+          turned.yaw = prev_yaw + alpha * dyaw;
+          const auto turn_hit = checker.check(occupancy_map, point, turned);
+          if (turn_hit.in_collision) {
+            local.in_collision = true;
+            local.first_collision_time = tc;
+            local.first_collision_point = turn_hit.hit_point;
+            return local;
+          }
+        }
+        prev_yaw = yaw;
+      }
+      return local;
+    });
+  }
+
+  void publishFootprintMarkerAlongTrajectory(
+    const nav3d::planner::UniformBspline& trajectory)
+  {
+    if (!footprint_marker_pub_ || !ground_search_options_.footprint_enabled) {
+      return;
+    }
+
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = frame_id_;
+    marker.header.stamp = now();
+    marker.ns = "nav3d_footprint";
+    marker.id = 0;
+    marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = 0.03;
+    marker.color.r = 0.1F;
+    marker.color.g = 0.85F;
+    marker.color.b = 0.35F;
+    marker.color.a = 0.95F;
+
+    const double duration = trajectory.duration();
+    if (duration <= 0.0) {
+      marker.action = visualization_msgs::msg::Marker::DELETE;
+      footprint_marker_pub_->publish(marker);
+      return;
+    }
+
+    makeCollisionPlanningMap([&](const nav3d::map::IMap& occupancy_map) {
+      const double sample_dt = std::max(0.15, duration / 16.0);
+      const double pitch_window = 0.5;
+      for (double t = 0.0; t <= duration + 1e-9; t += sample_dt) {
+        const double tc = std::min(t, duration);
+        const auto point = trajectory.evaluate(tc);
+        const double t0 = std::max(0.0, tc - pitch_window);
+        const double t1 = std::min(duration, tc + pitch_window);
+        const auto a = trajectory.evaluate(t0);
+        const auto b = trajectory.evaluate(t1);
+        const double ds = std::hypot(b.x - a.x, b.y - a.y);
+        double yaw = 0.0;
+        if (ds > 1e-4) {
+          yaw = std::atan2(b.y - a.y, b.x - a.x);
+        }
+        const auto attitude = nav3d::collision::estimateBodyAttitude(
+          occupancy_map,
+          point,
+          yaw,
+          b.z - a.z,
+          ds,
+          ground_search_options_.footprint,
+          imuAttitudeOverride());
+        const auto box = nav3d::collision::makeOrientedBodyBox(
+          occupancy_map,
+          point,
+          attitude,
+          ground_search_options_.footprint);
+        const auto corners = nav3d::collision::bodyBoxWireframeCorners(box);
+        const std::size_t n = ground_search_options_.footprint.polygon.size();
+        if (corners.size() < 2 * n) {
+          continue;
+        }
+        auto push_edge = [&](const nav3d::common::Point3D& a_pt, const nav3d::common::Point3D& b_pt) {
+          geometry_msgs::msg::Point pa;
+          pa.x = a_pt.x;
+          pa.y = a_pt.y;
+          pa.z = a_pt.z;
+          geometry_msgs::msg::Point pb;
+          pb.x = b_pt.x;
+          pb.y = b_pt.y;
+          pb.z = b_pt.z;
+          marker.points.push_back(pa);
+          marker.points.push_back(pb);
+        };
+        for (std::size_t i = 0; i < n; ++i) {
+          push_edge(corners[i], corners[(i + 1) % n]);
+          push_edge(corners[n + i], corners[n + ((i + 1) % n)]);
+          push_edge(corners[i], corners[n + i]);
+        }
+      }
+      return 0;
+    });
+    footprint_marker_pub_->publish(marker);
+  }
+
+  void publishCurrentFootprintMarker()
+  {
+    if (!footprint_marker_pub_ ||
+        !ground_search_options_.footprint_enabled ||
+        !current_position_.has_value()) {
+      return;
+    }
+
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = frame_id_;
+    marker.header.stamp = now();
+    marker.ns = "nav3d_footprint_current";
+    marker.id = 1;
+    marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = 0.04;
+    marker.color.r = 0.95F;
+    marker.color.g = 0.55F;
+    marker.color.b = 0.1F;
+    marker.color.a = 1.0F;
+
+    makeCollisionPlanningMap([&](const nav3d::map::IMap& occupancy_map) {
+      double yaw = current_yaw_.value_or(0.0);
+      double path_dz = 0.0;
+      double path_ds = 0.0;
+      if (active_trajectory_.has_value()) {
+        const double duration = active_trajectory_->duration();
+        const double t = std::clamp(tracking_path_time_.value_or(0.0), 0.0, duration);
+        const double t0 = std::max(0.0, t - 0.5);
+        const double t1 = std::min(duration, t + 0.5);
+        const auto a = active_trajectory_->evaluate(t0);
+        const auto b = active_trajectory_->evaluate(t1);
+        path_dz = b.z - a.z;
+        path_ds = std::hypot(b.x - a.x, b.y - a.y);
+        if (path_ds > 1e-4) {
+          yaw = std::atan2(b.y - a.y, b.x - a.x);
+        }
+      }
+      const auto attitude = nav3d::collision::estimateBodyAttitude(
+        occupancy_map,
+        *current_position_,
+        yaw,
+        path_dz,
+        path_ds,
+        ground_search_options_.footprint,
+        imuAttitudeOverride());
+      RCLCPP_DEBUG_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        1000,
+        "footprint_attitude yaw=%.3f pitch=%.3f path_pitch=%.3f",
+        attitude.yaw,
+        attitude.pitch,
+        path_ds > 1e-6 ? std::atan2(path_dz, path_ds) : 0.0);
+      const auto box = nav3d::collision::makeOrientedBodyBox(
+        occupancy_map,
+        *current_position_,
+        attitude,
+        ground_search_options_.footprint);
+      const auto corners = nav3d::collision::bodyBoxWireframeCorners(box);
+      const std::size_t n = ground_search_options_.footprint.polygon.size();
+      auto push_edge = [&](const nav3d::common::Point3D& a, const nav3d::common::Point3D& b) {
+        geometry_msgs::msg::Point pa;
+        pa.x = a.x;
+        pa.y = a.y;
+        pa.z = a.z;
+        geometry_msgs::msg::Point pb;
+        pb.x = b.x;
+        pb.y = b.y;
+        pb.z = b.z;
+        marker.points.push_back(pa);
+        marker.points.push_back(pb);
+      };
+      for (std::size_t i = 0; i < n && corners.size() >= 2 * n; ++i) {
+        push_edge(corners[i], corners[(i + 1) % n]);
+        push_edge(corners[n + i], corners[n + ((i + 1) % n)]);
+        push_edge(corners[i], corners[n + i]);
+      }
+      return 0;
+    });
+    footprint_marker_pub_->publish(marker);
   }
 
   // W-B (v3.8): raw-A* feasibility probe. Used by replanFromCurrentPose to
@@ -3513,6 +4876,9 @@ private:
   PlanningTraversabilityMode planning_traversability_mode_ = PlanningTraversabilityMode::Uav;
   bool planning_use_octomap_map_ = false;
   GroundSearchOptions ground_search_options_;
+  std::string imu_topic_ = "/imu";
+  bool imu_use_for_body_attitude_ = false;
+  std::optional<nav3d::collision::BodyAttitude> imu_attitude_;
   nav3d::common::Point3D start_;
   std::optional<nav3d::common::Point3D> current_position_;
   std::optional<double> current_yaw_;
@@ -3532,6 +4898,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr trajectory_marker_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr start_marker_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr footprint_marker_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr occupied_grid_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr planning_occupied_markers_pub_;
 #ifdef NAV3D_HAS_OCTOMAP_MSGS
@@ -3546,6 +4913,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr current_pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr clicked_point_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr cancel_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr local_pointcloud_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr map_load_sub_;
   rclcpp::Service<GetPlan>::SharedPtr plan_service_;
